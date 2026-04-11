@@ -4,21 +4,52 @@ Release:       1%{?dist}
 Summary:       C++ daemon for accessing the I2P network
 Conflicts:     i2pd-git
 
+%if 0%{?rhel} == 7
+%global boost_major     1
+%global boost_minor     89
+%global boost_patch     0
+%global boost_version   %{boost_major}.%{boost_minor}.%{boost_patch}
+%global boost_ver_enc   %{boost_major}_%{boost_minor}_%{boost_patch}
+%endif
+
 License:       BSD
 URL:           https://github.com/PurpleI2P/i2pd
 Source0:       https://github.com/PurpleI2P/i2pd/archive/%{version}/%name-%version.tar.gz
+%if 0%{?rhel} == 7
+Source1:       https://archives.boost.io/release/%{boost_version}/source/boost_%{boost_ver_enc}.tar.gz
+%endif
 
 Provides: group(i2pd) = %{version}-%{release}
 Provides:  user(i2pd) = %{version}-%{release}
 
+%if 0%{?rhel} == 7
+Provides: libboost_atomic.so = %{boost_version}
+Provides: libboost_program_options.so = %{boost_version}
+Provides: libboost_filesystem.so = %{boost_version}
+Conflicts: boost = %{boost_version}
+Conflicts: libboost_atomic.so = %{boost_version}
+Conflicts: libboost_program_options.so = %{boost_version}
+Conflicts: libboost_filesystem.so = %{boost_version}
+%endif
+
+
+%if 0%{?rhel} == 7
+BuildRequires: cmake3
+%else
 BuildRequires: cmake
+%endif
 
 BuildRequires: chrpath
+%if 0%{?rhel} == 7
+BuildRequires: devtoolset-8
+BuildRequires: openssl11-devel
+%else
 BuildRequires: gcc-c++
-BuildRequires: zlib-devel
 BuildRequires: boost-devel
 BuildRequires: openssl-devel
-BuildRequires: miniupnpc-devel
+%endif
+BuildRequires: zlib-devel
+#BuildRequires: miniupnpc-devel
 BuildRequires: systemd-units
 
 %if 0%{?fedora} == 41
@@ -34,15 +65,39 @@ Requires(pre): %{_sbindir}/useradd %{_sbindir}/groupadd
 C++ implementation of I2P.
 
 
+%if 0%{?rhel} == 7
+%global _i2pd_builddir %{_builddir}/%{name}-%{version}
+%global _boost_builddir %{_builddir}/boost_%{boost_ver_enc}
+%global _boost_buildinstall %{_i2pd_builddir}/boost_%{boost_ver_enc}-install
+%endif
+
+
 %prep
 %setup -q
+%if 0%{?rhel} == 7
+%setup -q -T -D -b 1
+mkdir -p %{_i2pd_builddir}/openssl11
+ln -s /usr/lib64/openssl11 %{_i2pd_builddir}/openssl11/lib
+ln -s /usr/include/openssl11 %{_i2pd_builddir}/openssl11/include
+mkdir -p %{_boost_buildinstall}
+%endif
 
 
 %build
+%if 0%{?rhel} == 7
+. /opt/rh/devtoolset-8/enable
+cd %{_boost_builddir}
+./bootstrap.sh --prefix=%{_boost_buildinstall} --with-libraries=program_options --with-libraries=filesystem
+./b2 %{?_smp_mflags} --prefix=%{_boost_buildinstall} install
+cd %{_i2pd_builddir}/build
+export OPENSSL_ROOT_DIR=%{_i2pd_builddir}/openssl11
+export BOOST_ROOT=%{_boost_buildinstall}
+%cmake3 \
+%else
 cd build
 %cmake \
+%endif
   -DWITH_LIBRARY=OFF \
-  -DWITH_UPNP=ON \
   -DWITH_HARDENING=ON \
 %if 0%{?fedora} > 29
   -DBUILD_SHARED_LIBS:BOOL=OFF \
@@ -100,6 +155,12 @@ chrpath -d i2pd
 %{__cp} -r %{_builddir}/%{name}-%{version}/contrib/tunnels.d/ %{buildroot}%{_sysconfdir}/i2pd/tunnels.conf.d
 ln -s %{_datadir}/%{name}/certificates %{buildroot}%{_sharedstatedir}/i2pd/certificates
 
+%if 0%{?rhel} == 7
+%{__install} -D -m 755 %{_boost_buildinstall}/lib/libboost_atomic.so.%{boost_version} %{buildroot}%{_libdir}/libboost_atomic.so.%{boost_version}
+%{__install} -D -m 755 %{_boost_buildinstall}/lib/libboost_program_options.so.%{boost_version} %{buildroot}%{_libdir}/libboost_program_options.so.%{boost_version}
+%{__install} -D -m 755 %{_boost_buildinstall}/lib/libboost_filesystem.so.%{boost_version} %{buildroot}%{_libdir}/libboost_filesystem.so.%{boost_version}
+%endif
+
 
 %pre
 getent group i2pd >/dev/null || %{_sbindir}/groupadd -r i2pd
@@ -134,6 +195,12 @@ getent passwd i2pd >/dev/null || \
 %dir %attr(0700,i2pd,i2pd) %{_localstatedir}/log/i2pd
 %{_datadir}/i2pd/certificates
 %{_sharedstatedir}/i2pd/certificates
+
+%if 0%{?rhel} == 7
+%{_libdir}/libboost_atomic.so.%{boost_version}
+%{_libdir}/libboost_program_options.so.%{boost_version}
+%{_libdir}/libboost_filesystem.so.%{boost_version}
+%endif
 
 
 %changelog
