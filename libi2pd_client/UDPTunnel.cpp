@@ -23,6 +23,7 @@ namespace client
 
 	constexpr uint8_t UDP_SESSION_FLAG_RESET_PATH = 0x01;
 	constexpr uint8_t UDP_SESSION_FLAG_ACK_REQUESTED = 0x02;
+	constexpr uint8_t UDP_SESSION_FLAG_RESET_SEQN = 0x04;
 
 	void I2PUDPServerTunnel::HandleRecvFromI2P(const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort,
 		const uint8_t * buf, size_t len, const i2p::util::Mapping * options)
@@ -46,13 +47,15 @@ namespace client
 			{
 				if (flags & UDP_SESSION_FLAG_RESET_PATH)
 					m_LastSession->GetDatagramSession ()->DropSharedRoutingPath ();
+				if ((flags & UDP_SESSION_FLAG_RESET_SEQN) && seqn)
+					m_LastSession->m_LastReceivedPacketNum = seqn;
 				if (flags & UDP_SESSION_FLAG_ACK_REQUESTED)
 				{
 					i2p::util::Mapping replyOptions;
 					replyOptions.Put (UDP_SESSION_ACKED, m_LastSession->m_LastReceivedPacketNum);
 					m_LastSession->m_Destination->SendDatagram(m_LastSession->GetDatagramSession (),
 						nullptr, 0, m_LastSession->LocalPort, m_LastSession->RemotePort, &replyOptions); // Ack only, no payload
-					m_LastSession->LastRepliableDatagramTime = i2p::util::GetMillisecondsSinceEpoch ();
+					m_LastSession->m_LastRepliableDatagramTime = i2p::util::GetMillisecondsSinceEpoch ();
 				}
 			}
 			if (options->Get (UDP_SESSION_ACKED, seqn))
@@ -156,14 +159,18 @@ namespace client
 
 	void UDPConnection::Acked (uint32_t seqn)
 	{
-		if (!m_AckTimerSeqn) seqn = m_UnackedDatagrams.back ().first;	// if we recieve ack after paht change, clear window and send new datagrams
 		m_IsFirstPacket = false;	// first packet confirmed
-		if (m_AckTimerSeqn && seqn >= m_AckTimerSeqn)
+		if (m_AckTimerSeqn)
 		{
-			m_AckTimerSeqn = 0;
-			m_AckTimer.cancel ();
+			if (seqn >= m_AckTimerSeqn)
+			{
+				m_AckTimerSeqn = 0;
+				m_AckTimer.cancel ();
+			}
 		}
-		if (m_UnackedDatagrams.empty () && seqn < m_UnackedDatagrams.front ().first) return;
+		else if (!m_UnackedDatagrams.empty ())
+			seqn = m_UnackedDatagrams.back ().first;	// if we receive ack after path change, clear window and send new datagrams
+		if (m_UnackedDatagrams.empty () || seqn < m_UnackedDatagrams.front ().first) return;
 		bool acknowledged = false;
 		auto it = m_UnackedDatagrams.begin ();
 		while (it != m_UnackedDatagrams.end ())
@@ -192,7 +199,7 @@ namespace client
 		if (!m_AckTimerSeqn)
 		{
 			m_AckTimerSeqn = seqn;
-			m_AckTimer.expires_from_now (boost::posix_time::milliseconds (m_RTT ? 2*m_RTT : I2P_UDP_MAX_UNACKED_DATAGRAM_TIME));
+			m_AckTimer.expires_after (std::chrono::milliseconds (m_RTT ? 2*m_RTT : I2P_UDP_MAX_UNACKED_DATAGRAM_TIME));
 			m_AckTimer.async_wait ([this](const boost::system::error_code& ecode)
 				{
 					if (ecode != boost::asio::error::operation_aborted)
@@ -208,7 +215,7 @@ namespace client
 						options.Put (UDP_SESSION_FLAGS, UDP_SESSION_FLAG_RESET_PATH | UDP_SESSION_FLAG_ACK_REQUESTED);
 						auto session = GetDatagramSession ();
 						session->DropSharedRoutingPath ();
-						GetDatagramDestination ()->SendDatagram (session, nullptr, 0, 0, 0, &options);
+						m_Destination->SendDatagram (session, nullptr, 0, 0, 0, &options);
 					}
 				});
 		}
@@ -227,16 +234,27 @@ namespace client
 		m_UnackedDatagrams.erase (m_UnackedDatagrams.begin (), it);
 	}
 
+	std::shared_ptr<i2p::datagram::DatagramSession> UDPConnection::GetDatagramSession ()
+	{
+		auto session = m_LastDatagramSession.lock ();
+		if (!session && isIdentity)
+		{
+			session = m_Destination->GetSession (Identity);
+			m_LastDatagramSession = session;
+		}
+		return session;
+	}
+
 	UDPSession::UDPSession(boost::asio::ip::udp::endpoint localEndpoint,
 		const std::shared_ptr<i2p::client::ClientDestination> & localDestination,
 		const boost::asio::ip::udp::endpoint& endpoint, const i2p::data::IdentHash& to,
 		uint16_t ourPort, uint16_t theirPort) :
-		UDPConnection (localDestination->GetService()),
-		m_Destination(localDestination->GetDatagramDestination()),
-		IPSocket(localDestination->GetService(), localEndpoint), Identity (to),
+		UDPConnection (localDestination->GetService(), localDestination->GetDatagramDestination()),
+		IPSocket(localDestination->GetService(), localEndpoint),
 		SendEndpoint(endpoint), LastActivity(i2p::util::GetMillisecondsSinceEpoch()),
-		LastRepliableDatagramTime (0), LocalPort(ourPort), RemotePort(theirPort)
+		LocalPort(ourPort), RemotePort(theirPort)
 	{
+		SetIdentity (to);
 		Start ();
 		IPSocket.set_option (boost::asio::socket_base::receive_buffer_size (I2P_UDP_MAX_MTU ));
 		IPSocket.non_blocking (true);
@@ -256,16 +274,21 @@ namespace client
 		{
 			if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
 			{
-				// window is full, drop packet
-				Receive ();
-				return;
+				// window is full, try to delete expired unacked datagrams first
+				DeleteExpiredUnackedDatagrams ();
+				if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
+				{
+					// window is full, drop packet
+					Receive ();
+					return;
+				}
 			}
 			LogPrint(eLogDebug, "UDPSession: Forward ", len, "B from ", FromEndpoint);
 			auto ts = i2p::util::GetMillisecondsSinceEpoch();
 			auto session = GetDatagramSession ();
 			uint64_t repliableDatagramInterval = I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL;
 			if (m_RTT && m_RTT >= I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL && m_RTT < I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL*10) repliableDatagramInterval = m_RTT/10; // 10 - 100 ms
-			if (ts > LastRepliableDatagramTime + repliableDatagramInterval)
+			if (ts > m_LastRepliableDatagramTime + repliableDatagramInterval)
 			{
 				if (session->GetVersion () == i2p::datagram::eDatagramV3)
 				{
@@ -277,6 +300,8 @@ namespace client
 						m_UnackedDatagrams.push_back ({ m_NextSendPacketNum, ts });
 						ScheduleAckTimer (m_NextSendPacketNum);
 					}
+					if (m_IsFirstPacket)
+						flags |= UDP_SESSION_FLAG_RESET_SEQN;
 					i2p::util::Mapping options;
 					options.Put (UDP_SESSION_SEQN, m_NextSendPacketNum);
 					if (m_LastReceivedPacketNum > 0)
@@ -288,7 +313,7 @@ namespace client
 				}
 				else
 					m_Destination->SendDatagram(session, m_Buffer, len, LocalPort, RemotePort);
-				LastRepliableDatagramTime = ts;
+				m_LastRepliableDatagramTime = ts;
 			}
 			else
 				m_Destination->SendRawDatagram(session, m_Buffer, len, LocalPort, RemotePort);
@@ -311,17 +336,6 @@ namespace client
 		}
 		else
 			LogPrint(eLogError, "UDPSession: ", ecode.message());
-	}
-
-	std::shared_ptr<i2p::datagram::DatagramSession> UDPSession::GetDatagramSession ()
-	{
-		auto session = m_LastDatagramSession.lock ();
-		if (!session)
-		{
-			session = m_Destination->GetSession (Identity);
-			m_LastDatagramSession = session;
-		}
-		return session;
 	}
 
 	I2PUDPServerTunnel::I2PUDPServerTunnel (const std::string & name, std::shared_ptr<i2p::client::ClientDestination> localDestination,
@@ -389,11 +403,10 @@ namespace client
 		const boost::asio::ip::udp::endpoint& localEndpoint,
 		std::shared_ptr<i2p::client::ClientDestination> localDestination,
 		uint16_t remotePort, bool gzip, i2p::datagram::DatagramVersion datagramVersion) :
-		UDPConnection (localDestination->GetService ()),
+		UDPConnection (localDestination->GetService (), localDestination->GetDatagramDestination ()),
 		m_Name (name), m_RemoteDest (remoteDest), m_LocalDest (localDestination), m_LocalEndpoint (localEndpoint),
 		m_ResolveThread (nullptr), m_LocalSocket (nullptr), RemotePort (remotePort),
-		m_LastPort (0), m_cancel_resolve (false), m_Gzip (gzip), m_DatagramVersion (datagramVersion),
-		m_LastRepliableDatagramTime (0)
+		m_LastPort (0), m_cancel_resolve (false), m_Gzip (gzip), m_DatagramVersion (datagramVersion)
 	{
 	}
 
@@ -414,16 +427,14 @@ namespace client
 		m_LocalSocket->non_blocking (true);
 
 		auto dgram = m_LocalDest->CreateDatagramDestination (m_Gzip, m_DatagramVersion);
+		m_Destination = dgram;
 		dgram->SetReceiver (std::bind (&I2PUDPClientTunnel::HandleRecvFromI2P, this,
 			std::placeholders::_1, std::placeholders::_2,
 			std::placeholders::_3, std::placeholders::_4,
-			std::placeholders::_5, std::placeholders::_6),
-			RemotePort
-		);
+			std::placeholders::_5, std::placeholders::_6));
+
 		dgram->SetRawReceiver (std::bind (&I2PUDPClientTunnel::HandleRecvFromI2PRaw, this,
-			std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4),
-			RemotePort
-		);
+			std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
 
 		m_LocalDest->Start ();
 		if (m_ResolveThread == nullptr)
@@ -434,9 +445,10 @@ namespace client
 	void I2PUDPClientTunnel::Stop ()
 	{
 		auto dgram = m_LocalDest->GetDatagramDestination ();
-		if (dgram) {
-			dgram->ResetReceiver (RemotePort);
-			dgram->ResetRawReceiver (RemotePort);
+		if (dgram)
+		{
+			dgram->ResetReceiver ();
+			dgram->ResetRawReceiver ();
 		}
 		m_cancel_resolve = true;
 
@@ -451,7 +463,6 @@ namespace client
 			delete m_ResolveThread;
 			m_ResolveThread = nullptr;
 		}
-		m_RemoteAddr = nullptr;
 		UDPConnection::Stop ();
 	}
 
@@ -472,17 +483,38 @@ namespace client
 			RecvFromLocal (); // Restart listener and continue work
 			return;
 		}
-		if (!m_RemoteAddr || !m_RemoteAddr->IsIdentHash ())  // TODO: handle B33
+		if (!isIdentity)
 		{
 			LogPrint (eLogWarning, "UDP Client: Remote endpoint not resolved yet");
 			RecvFromLocal ();
 			return; // drop, remote not resolved
 		}
-		if ((!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS) || !m_IsSendingAllowed)
+		if (!m_IsSendingAllowed)
 		{
-			// window is full, drop packet
-			RecvFromLocal ();
-			return;
+			if (!m_IsFirstPacket && i2p::util::GetMillisecondsSinceEpoch () >  m_LastRepliableDatagramTime + I2P_UDP_SESSION_TIMEOUT)
+			{
+				//  reset session
+				m_IsFirstPacket = true;
+				m_IsSendingAllowed = true;
+				m_AckTimerSeqn = 0;
+				m_RTT = 0;
+			}
+			if (!m_IsSendingAllowed)
+			{
+				RecvFromLocal ();
+				return;
+			}
+		}
+		if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
+		{
+			// window is full, try to delete expired unacked datagrams first
+			DeleteExpiredUnackedDatagrams ();
+			if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
+			{
+				// window is still full, drop packet
+				RecvFromLocal ();
+				return;
+			}
 		}
 		auto remotePort = m_RecvEndpoint.port ();
 		if (!m_LastPort || m_LastPort != remotePort)
@@ -499,7 +531,7 @@ namespace client
 		}
 		// send off to remote i2p destination
 		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
-		LogPrint (eLogDebug, "UDP Client: Send ", transferred, " to ", m_RemoteAddr->identHash.ToBase32 (), ":", RemotePort);
+		LogPrint (eLogDebug, "UDP Client: Send ", transferred, " to ", Identity.ToBase32 (), ":", RemotePort);
 		auto session = GetDatagramSession ();
 		uint64_t repliableDatagramInterval = I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL;
 		if (m_RTT && m_RTT >= I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL && m_RTT < I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL*10) repliableDatagramInterval = m_RTT/10; // 10 - 100 ms
@@ -515,21 +547,23 @@ namespace client
 					m_UnackedDatagrams.push_back ({ m_NextSendPacketNum, ts });
 					ScheduleAckTimer (m_NextSendPacketNum);
 				}
+				if (m_IsFirstPacket)
+					flags |= UDP_SESSION_FLAG_RESET_SEQN;
 				i2p::util::Mapping options;
 				options.Put (UDP_SESSION_SEQN, m_NextSendPacketNum);
 				if (m_LastReceivedPacketNum > 0)
 					options.Put (UDP_SESSION_ACKED, m_LastReceivedPacketNum);
 				if (flags)
 					options.Put (UDP_SESSION_FLAGS, flags);
-				m_LocalDest->GetDatagramDestination ()->SendDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort, &options);
+				m_Destination->SendDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort, &options);
 				if (m_IsFirstPacket) m_IsSendingAllowed = false; // send only one packet at the start and wait ack
 			}
 			else
-				m_LocalDest->GetDatagramDestination ()->SendDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
+				m_Destination->SendDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
 			m_LastRepliableDatagramTime = ts;
 		}
 		else
-			m_LocalDest->GetDatagramDestination ()->SendRawDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
+			m_Destination->SendRawDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
 		size_t numPackets = 0;
 		while (numPackets < i2p::datagram::DATAGRAM_SEND_QUEUE_MAX_SIZE)
 		{
@@ -539,13 +573,13 @@ namespace client
 			transferred = m_LocalSocket->receive_from (boost::asio::buffer (m_RecvBuff, I2P_UDP_MAX_MTU), m_RecvEndpoint, 0, ec);
 			remotePort = m_RecvEndpoint.port ();
 			// TODO: check remotePort
-			m_LocalDest->GetDatagramDestination ()->SendRawDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
+			m_Destination->SendRawDatagram (session, m_RecvBuff, transferred, remotePort, RemotePort);
 			numPackets++;
 		}
 		if (numPackets)
-			LogPrint (eLogDebug, "UDP Client: Sent ", numPackets, " more packets to ", m_RemoteAddr->identHash.ToBase32 ());
+			LogPrint (eLogDebug, "UDP Client: Sent ", numPackets, " more packets to ", Identity.ToBase32 ());
 		m_NextSendPacketNum += numPackets + 1;
-		m_LocalDest->GetDatagramDestination ()->FlushSendQueue (session);
+		m_Destination->FlushSendQueue (session);
 
 		// mark convo as active
 		if (m_LastSession)
@@ -565,7 +599,8 @@ namespace client
 		i2p::util::SetThreadName ("UDP Resolver");
 		LogPrint (eLogInfo, "UDP Tunnel: Trying to resolve ", m_RemoteDest);
 
-		while (!(m_RemoteAddr = context.GetAddressBook().GetAddress(m_RemoteDest)) && !m_cancel_resolve)
+		std::shared_ptr<const Address> remoteAddr;
+		while (!(remoteAddr = context.GetAddressBook().GetAddress(m_RemoteDest)) && !m_cancel_resolve)
 		{
 			LogPrint (eLogWarning, "UDP Tunnel: Failed to lookup ", m_RemoteDest);
 			std::this_thread::sleep_for (std::chrono::seconds (1));
@@ -575,29 +610,24 @@ namespace client
 			LogPrint(eLogError, "UDP Tunnel: Lookup of ", m_RemoteDest, " was cancelled");
 			return;
 		}
-		if (!m_RemoteAddr)
+		if (!remoteAddr)
 		{
 			LogPrint (eLogError, "UDP Tunnel: ", m_RemoteDest, " not found");
 			return;
 		}
-		LogPrint(eLogInfo, "UDP Tunnel: Resolved ", m_RemoteDest, " to ", m_RemoteAddr->identHash.ToBase32 ());
-	}
-
-	std::shared_ptr<i2p::datagram::DatagramSession> I2PUDPClientTunnel::GetDatagramSession ()
-	{
-		auto session = m_LastDatagramSession.lock ();
-		if (!session)
+		if (!remoteAddr->IsIdentHash ()) // TODO: handle B33
 		{
-			session = m_LocalDest->GetDatagramDestination ()->GetSession (m_RemoteAddr->identHash);
-			m_LastDatagramSession = session;
+			LogPrint (eLogError, "UDP Tunnel: ", m_RemoteDest, " resolved to invalid address type");
+			return;
 		}
-		return session;
+		LogPrint(eLogInfo, "UDP Tunnel: Resolved ", m_RemoteDest, " to ", remoteAddr->identHash.ToBase32 ());
+		SetIdentity (remoteAddr->identHash);
 	}
 
 	void I2PUDPClientTunnel::HandleRecvFromI2P (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort,
 		const uint8_t * buf, size_t len, const i2p::util::Mapping * options)
 	{
-		if (m_RemoteAddr && from.GetIdentHash() == m_RemoteAddr->identHash)
+		if (isIdentity && from.GetIdentHash() == Identity)
 		{
 			if (options)
 			{
@@ -605,13 +635,18 @@ namespace client
 				if (options->Get (UDP_SESSION_SEQN, seqn) && seqn > m_LastReceivedPacketNum)
 					m_LastReceivedPacketNum = seqn;
 				uint8_t flags = 0;
-				if (options->Get (UDP_SESSION_FLAGS, flags) && (flags & UDP_SESSION_FLAG_ACK_REQUESTED))
+				if (options->Get (UDP_SESSION_FLAGS, flags))
 				{
-					i2p::util::Mapping replyOptions;
-					replyOptions.Put (UDP_SESSION_ACKED, m_LastReceivedPacketNum);
-					m_LocalDest->GetDatagramDestination ()->SendDatagram (GetDatagramSession (),
-						nullptr, 0, m_LastPort, RemotePort, &replyOptions); // Ack only, no payload
-					m_LastRepliableDatagramTime = i2p::util::GetMillisecondsSinceEpoch ();
+					if ((flags & UDP_SESSION_FLAG_RESET_SEQN) && seqn)
+						m_LastReceivedPacketNum = seqn;
+					if (flags & UDP_SESSION_FLAG_ACK_REQUESTED)
+					{
+						i2p::util::Mapping replyOptions;
+						replyOptions.Put (UDP_SESSION_ACKED, m_LastReceivedPacketNum);
+						m_Destination->SendDatagram (GetDatagramSession (),
+							nullptr, 0, m_LastPort, RemotePort, &replyOptions); // Ack only, no payload
+						m_LastRepliableDatagramTime = i2p::util::GetMillisecondsSinceEpoch ();
+					}
 				}
 				if (options->Get (UDP_SESSION_ACKED, seqn))
 					Acked (seqn);
@@ -632,7 +667,7 @@ namespace client
 			// found convo
 			if (len > 0)
 			{
-				LogPrint (eLogDebug, "UDP Client: Got ", len, "B from ", m_RemoteAddr ? m_RemoteAddr->identHash.ToBase32 () : "");
+				LogPrint (eLogDebug, "UDP Client: Got ", len, "B from ", isIdentity ? Identity.ToBase32 () : "");
 				boost::system::error_code ec;
 				m_LocalSocket->send_to (boost::asio::buffer (buf, len), itr->second->first, 0, ec);
 				if (!ec)

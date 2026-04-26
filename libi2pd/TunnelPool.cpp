@@ -45,7 +45,8 @@ namespace tunnel
 		m_NumInboundHops (numInboundHops), m_NumOutboundHops (numOutboundHops),
 		m_NumInboundTunnels (numInboundTunnels), m_NumOutboundTunnels (numOutboundTunnels),
 		m_InboundVariance (inboundVariance), m_OutboundVariance (outboundVariance),
-		m_IsActive (true), m_IsHighBandwidth (isHighBandwidth), m_CustomPeerSelector(nullptr)
+		m_IsActive (true), m_IsHighBandwidth (isHighBandwidth), m_CustomPeerSelector(nullptr),
+		m_Rng (i2p::util::GetMonotonicMicroseconds ()%1000000LL)
 	{
 		if (m_NumInboundTunnels > TUNNEL_POOL_MAX_INBOUND_TUNNELS_QUANTITY)
 			m_NumInboundTunnels = TUNNEL_POOL_MAX_INBOUND_TUNNELS_QUANTITY;
@@ -59,7 +60,7 @@ namespace tunnel
 			m_InboundVariance = (m_NumInboundHops < STANDARD_NUM_RECORDS) ? STANDARD_NUM_RECORDS - m_NumInboundHops : 0;
 		if (m_OutboundVariance > 0 && m_NumOutboundHops + m_OutboundVariance > STANDARD_NUM_RECORDS)
 			m_OutboundVariance = (m_NumOutboundHops < STANDARD_NUM_RECORDS) ? STANDARD_NUM_RECORDS - m_NumOutboundHops : 0;
-		m_NextManageTime = i2p::util::GetSecondsSinceEpoch () + rand () % TUNNEL_POOL_MANAGE_INTERVAL;
+		m_NextManageTime = i2p::util::GetSecondsSinceEpoch () + m_Rng () % TUNNEL_POOL_MANAGE_INTERVAL;
 	}
 
 	TunnelPool::~TunnelPool ()
@@ -233,7 +234,7 @@ namespace tunnel
 		typename TTunnels::value_type excluded, i2p::data::RouterInfo::CompatibleTransports compatible)
 	{
 		if (tunnels.empty ()) return nullptr;
-		uint32_t ind = (m_LocalDestination ? m_LocalDestination->GetRng ()() : rand ()) % (tunnels.size ()/2 + 1), i = 0;
+		uint32_t ind = m_Rng () % (tunnels.size ()/2 + 1), i = 0;
 		bool skipped = false;
 		typename TTunnels::value_type tunnel = nullptr;
 		for (const auto& it: tunnels)
@@ -253,7 +254,7 @@ namespace tunnel
 		}
 		if (!tunnel && skipped)
 		{
-			ind = (m_LocalDestination ? m_LocalDestination->GetRng ()() : rand ()) % (tunnels.size ()/2 + 1), i = 0;
+			ind = m_Rng () % (tunnels.size ()/2 + 1), i = 0;
 			for (const auto& it: tunnels)
 			{
 				if (it->IsEstablished () && it != excluded)
@@ -294,6 +295,11 @@ namespace tunnel
 
 	void TunnelPool::CreateTunnels ()
 	{
+		CreateTunnels (i2p::util::GetSecondsSinceEpoch ());
+	}
+
+	void TunnelPool::CreateTunnels (uint64_t ts)
+	{
 		int num = 0;
 		{
 			std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
@@ -305,7 +311,7 @@ namespace tunnel
 		{
 			if (num > TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS) num = TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS;
 			for (int i = 0; i < num; i++)
-				CreateOutboundTunnel ();
+				CreateOutboundTunnel (ts);
 		}
 
 		num = 0;
@@ -330,14 +336,14 @@ namespace tunnel
 		{
 			if (num > TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS) num = TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS;
 			for (int i = 0; i < num; i++)
-				CreateInboundTunnel ();
+				CreateInboundTunnel (ts);
 		}
 
 		if (num < m_NumInboundTunnels && m_NumInboundHops <= 0 && m_LocalDestination) // zero hops IB
 			m_LocalDestination->SetLeaseSetUpdated (true); // update LeaseSet immediately
 	}
 
-	void TunnelPool::TestTunnels ()
+	void TunnelPool::TestTunnels (uint64_t ts)
 	{
 		decltype(m_Tests) tests;
 		{
@@ -360,7 +366,7 @@ namespace tunnel
 					else
 					{
 						it.second.first->SetState (eTunnelStateTestFailed);
-						CreateOutboundTunnel (); // create new tunnel immediately because last one failed
+						CreateOutboundTunnel (ts); // create new tunnel immediately because last one failed
 					}
 				}
 				else if (it.second.first->GetState () != eTunnelStateExpiring)
@@ -383,7 +389,7 @@ namespace tunnel
 							else
 							{
 								it.second.second->SetState (eTunnelStateTestFailed);
-								CreateInboundTunnel (); // create new tunnel immediately because last one failed
+								CreateInboundTunnel (ts); // create new tunnel immediately because last one failed
 							}
 						}
 						if (failed && m_LocalDestination)
@@ -407,6 +413,7 @@ namespace tunnel
 				if (it->IsEstablished ())
 					outboundTunnels.push_back (it);
 		}
+		if (outboundTunnels.empty ()) return;
 		std::shuffle (outboundTunnels.begin(), outboundTunnels.end(), tunnels.GetRng ());
 		std::vector<std::shared_ptr<InboundTunnel> > inboundTunnels;
 		{
@@ -415,6 +422,7 @@ namespace tunnel
 				if (it->IsEstablished ())
 					inboundTunnels.push_back (it);
 		}
+		if (inboundTunnels.empty ()) return;
 		std::shuffle (inboundTunnels.begin(), inboundTunnels.end(), tunnels.GetRng ());
 		auto it1 = outboundTunnels.begin ();
 		auto it2 = inboundTunnels.begin ();
@@ -472,8 +480,11 @@ namespace tunnel
 	{
 		if (ts > m_NextManageTime || ts + 2*TUNNEL_POOL_MANAGE_INTERVAL < m_NextManageTime) // in case if clock was adjusted
 		{
-			CreateTunnels ();
-			TestTunnels ();
+			if (!m_LocalDestination || !m_LocalDestination->IsIdling ())
+			{
+				CreateTunnels (ts);
+				TestTunnels (ts);
+			}
 			m_NextManageTime = ts + TUNNEL_POOL_MANAGE_INTERVAL + (tunnels.GetRng ()() % TUNNEL_POOL_MANAGE_INTERVAL)/2;
 		}
 	}
@@ -570,7 +581,8 @@ namespace tunnel
 				i2p::data::netdb.GetRandomRouter (prevHop, reverse, endpoint, false);
 			if (hop)
 			{
-				if (!hop->HasProfile () || !hop->GetProfile ()->IsBad ())
+				if ((!hop->HasProfile () || !hop->GetProfile ()->IsBad ()) &&
+					(prevHop != i2p::context.GetSharedRouterInfo () || !i2p::transport::transports.IsTooManyConnectionsFromSubnet (hop)))
 					break;
 			}
 			else if (tryClient)
@@ -732,13 +744,16 @@ namespace tunnel
 		return r;
 	}
 
-	void TunnelPool::CreateInboundTunnel ()
+	void TunnelPool::CreateInboundTunnel (uint64_t ts)
 	{
 		LogPrint (eLogDebug, "Tunnels: Creating destination inbound tunnel...");
 		Path path;
 		if (SelectPeers (path, true))
 		{
-			auto outboundTunnel = GetNextOutboundTunnel (nullptr, path.farEndTransports);
+			 // if we are out of inbound tunnels and last outbound was not create recently most like it's dead
+			auto outboundTunnel =  (!m_InboundTunnels.empty () || (!m_OutboundTunnels.empty () &&
+				ts < (*m_OutboundTunnels.begin ())->GetCreationTime () + TUNNEL_POOL_TUNNEL_CREATED_RECENTLY_INTERVAL)) ?
+					GetNextOutboundTunnel (nullptr, path.farEndTransports) : nullptr;
 			if (!outboundTunnel)
 				outboundTunnel = tunnels.GetNextOutboundTunnel ();
 			std::shared_ptr<TunnelConfig> config;
@@ -759,7 +774,7 @@ namespace tunnel
 	{
 		if (IsExploratory () || tunnel->IsSlow ()) // always create new exploratory tunnel or if slow
 		{
-			CreateInboundTunnel ();
+			CreateInboundTunnel (i2p::util::GetSecondsSinceEpoch ());
 			return;
 		}
 		auto outboundTunnel = GetNextOutboundTunnel (nullptr, tunnel->GetFarEndTransports ());
@@ -784,13 +799,16 @@ namespace tunnel
 		}
 	}
 
-	void TunnelPool::CreateOutboundTunnel ()
+	void TunnelPool::CreateOutboundTunnel (uint64_t ts)
 	{
 		LogPrint (eLogDebug, "Tunnels: Creating destination outbound tunnel...");
 		Path path;
 		if (SelectPeers (path, false))
 		{
-			auto inboundTunnel = GetNextInboundTunnel (nullptr, path.farEndTransports);
+			 // if we are out of outbound tunnels and last inbound was not create recently most like it's dead
+			auto inboundTunnel = (!m_OutboundTunnels.empty () || (!m_InboundTunnels.empty () &&
+				ts < (*m_InboundTunnels.begin ())->GetCreationTime () + TUNNEL_POOL_TUNNEL_CREATED_RECENTLY_INTERVAL)) ?
+					GetNextInboundTunnel (nullptr, path.farEndTransports) : nullptr;
 			if (!inboundTunnel)
 				inboundTunnel = tunnels.GetNextInboundTunnel ();
 			if (!inboundTunnel)
@@ -827,7 +845,7 @@ namespace tunnel
 	{
 		if (IsExploratory () || tunnel->IsSlow ()) // always create new exploratory tunnel or if slow
 		{
-			CreateOutboundTunnel ();
+			CreateOutboundTunnel (i2p::util::GetSecondsSinceEpoch ());
 			return;
 		}
 		auto inboundTunnel = GetNextInboundTunnel (nullptr, tunnel->GetFarEndTransports ());

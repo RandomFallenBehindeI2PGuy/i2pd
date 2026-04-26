@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2025, The PurpleI2P Project
+* Copyright (c) 2013-2026, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -952,6 +952,7 @@ namespace http {
 				if (it->GetSendQueueSize () > 0)
 					tmp_s << " [queue:" << it->GetSendQueueSize () << "]";
 				if (it->IsSlow ()) tmp_s << " [slow]";
+				if (it->GetVersion () > 2) tmp_s << " [pq=" << (int)it->GetVersion () << "]";
 				tmp_s << "</div>\r\n" << std::endl;
 				cnt++;
 			}
@@ -969,6 +970,8 @@ namespace http {
 					tmp_s6 << " [itag:" << it->GetRelayTag () << "]";
 				if (it->GetSendQueueSize () > 0)
 					tmp_s6 << " [queue:" << it->GetSendQueueSize () << "]";
+				if (it->IsSlow ()) tmp_s6 << " [slow]";
+				if (it->GetVersion () > 2) tmp_s6 << " [pq=" << (int)it->GetVersion () << "]";
 				tmp_s6 << "</div>\r\n" << std::endl;
 				cnt6++;
 			}
@@ -979,7 +982,10 @@ namespace http {
 			  << "</b> ( " << cnt << " )</label>\r\n"
 			  << "<input type=\"checkbox\" id=\"slide_" << boost::algorithm::to_lower_copy(name) << "\" />\r\n"
 			  << "<div class=\"slidecontent list\">\r\n\r\n"
-			  << tmp_s.str () << "</div>\r\n</div>\r\n<br>\r\n\r\n";
+			  << tmp_s.str ()
+			  << "<div class=\"listitem\">\r\n"
+			  << "&nbsp; </div>\r\n" << std::endl
+			  << "</div>\r\n</div>\r\n\r\n";
 		}
 		if (!tmp_s6.str ().empty ())
 		{
@@ -987,7 +993,10 @@ namespace http {
 			  << "v6</b> ( " << cnt6 << " )</label>\r\n"
 			  << "<input type=\"checkbox\" id=\"slide_" << boost::algorithm::to_lower_copy(name) << "v6\" />\r\n"
 			  << "<div class=\"slidecontent list\">\r\n\r\n"
-			  << tmp_s6.str () << "</div>\r\n</div>\r\n<br>\r\n\r\n";
+			  << tmp_s6.str ()
+			  << "<div class=\"listitem\">\r\n"
+			  << "&nbsp; </div>\r\n" << std::endl
+			  << "</div>\r\n</div>\r\n\r\n";
 		}
 	}
 

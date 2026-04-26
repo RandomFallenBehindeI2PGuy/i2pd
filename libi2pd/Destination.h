@@ -121,7 +121,7 @@ namespace client
 			LeaseSetRequest (boost::asio::io_context& service): requestTime (0), requestTimeoutTimer (service) {};
 			std::unordered_set<i2p::data::IdentHash> excluded;
 			uint64_t requestTime;
-			boost::asio::deadline_timer requestTimeoutTimer;
+			boost::asio::steady_timer requestTimeoutTimer;
 			std::list<RequestComplete> requestComplete;
 			std::shared_ptr<i2p::tunnel::OutboundTunnel> outboundTunnel;
 			std::shared_ptr<i2p::tunnel::InboundTunnel> replyTunnel;
@@ -223,7 +223,7 @@ namespace client
 			uint64_t m_LastSubmissionTime; // in seconds
 			std::unordered_set<i2p::data::IdentHash> m_ExcludedFloodfills; // for publishing
 
-			boost::asio::deadline_timer m_PublishConfirmationTimer, m_PublishVerificationTimer,
+			boost::asio::steady_timer m_PublishConfirmationTimer, m_PublishVerificationTimer,
 				m_PublishDelayTimer, m_CleanupTimer;
 			std::string m_Nickname;
 			int m_LeaseSetType, m_AuthType;
@@ -250,6 +250,7 @@ namespace client
 			void Stop () override;
 
 			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };
+			void SetPrivateKeys (const i2p::data::PrivateKeys& keys);
 			void Sign (const uint8_t * buf, int len, uint8_t * signature) const { m_Keys.Sign (buf, len, signature); };
 
 			// ref counter
@@ -333,7 +334,7 @@ namespace client
 			int m_RefCounter; // how many clients(tunnels) use this destination
 			uint64_t m_LastPublishedTimestamp;
 
-			boost::asio::deadline_timer m_ReadyChecker;
+			boost::asio::steady_timer m_ReadyChecker;
 
 			std::shared_ptr<std::vector<i2p::data::AuthPublicKey> > m_AuthKeys; // we don't need them for I2CP
 

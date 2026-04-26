@@ -15,6 +15,7 @@
 #include <map>
 #include <array>
 #include <random>
+#include <atomic>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <boost/asio.hpp>
@@ -29,10 +30,10 @@ namespace i2p
 namespace transport
 {
 
-	const size_t NTCP2_UNENCRYPTED_FRAME_MAX_SIZE = 65519;
-	const size_t NTCP2_SEND_AFTER_FRAME_SIZE = 16386; // send frame when exceeds this size
-	const size_t NTCP2_SESSION_REQUEST_MAX_SIZE = 287; // without ML-KEM frame
-	const size_t NTCP2_SESSION_CREATED_MAX_SIZE = 287;
+	constexpr size_t NTCP2_UNENCRYPTED_FRAME_MAX_SIZE = 65519;
+	constexpr size_t NTCP2_SEND_AFTER_FRAME_SIZE = 16386; // send frame when exceeds this size
+	constexpr size_t NTCP2_SESSION_HANDSHAKE_MAX_SIZE = 287; // SessionRequest/SesionCreated without ML-KEM frame
+	constexpr size_t NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE = 944; // for non-PQ
 	const int NTCP2_MAX_PADDING_RATIO = 6; // in %
 
 	const int NTCP2_CONNECT_TIMEOUT = 5; // 5 seconds
@@ -43,7 +44,7 @@ namespace transport
 	const int NTCP2_TERMINATION_CHECK_TIMEOUT_VARIANCE = 5; // 5 seconds
 	const int NTCP2_RECEIVE_BUFFER_DELETION_TIMEOUT = 3; // 3 seconds
 	const int NTCP2_ROUTERINFO_RESEND_INTERVAL = 25*60; // 25 minuntes in seconds
-	const int NTCP2_ROUTERINFO_RESEND_INTERVAL_THRESHOLD = 25*60; // 25 minuntes
+	const int NTCP2_ROUTERINFO_RESEND_INTERVAL_VARIANCE = 25*60; // 25 minuntes
 
 	const int NTCP2_CLOCK_SKEW = 60; // in seconds
 	const int NTCP2_MAX_OUTGOING_QUEUE_SIZE = 500; // how many messages we can queue up
@@ -128,13 +129,14 @@ namespace transport
 
 #if OPENSSL_PQ
         std::unique_ptr<i2p::crypto::MLKEMKeys> m_PQKeys;
-        uint8_t m_Buffer[NTCP2_SESSION_REQUEST_MAX_SIZE + i2p::crypto::MLKEM1024_KEY_LENGTH + 16],
+        static constexpr size_t m_MaxMsgSize = 2*i2p::crypto::MLKEM1024_KEY_LENGTH + 160;
 #else
-		uint8_t m_Buffer[NTCP2_SESSION_REQUEST_MAX_SIZE], // for SessionRequest and SessionCreated
+		static constexpr size_t m_MaxMsgSize = NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE;
 #endif
+		uint8_t m_Buffer[m_MaxMsgSize], // for SessionRequest and SessionCreated
             * m_SessionConfirmedBuffer;
 		size_t m_BufferLen;
-
+		bool m_IsLongPadding;
 	};
 
 	class NTCP2Server;
@@ -157,6 +159,7 @@ namespace transport
 
 			bool IsEstablished () const override { return m_IsEstablished; };
 			i2p::data::RouterInfo::SupportedTransports GetTransportType () const override;
+			boost::asio::ip::address GetRemoteAddress () const override { return m_RemoteEndpoint.address (); };
 			bool IsTerminated () const { return m_IsTerminated; };
 
 			void ClientLogin (); // Alice
@@ -221,7 +224,7 @@ namespace transport
 			NTCP2Server& m_Server;
 			boost::asio::ip::tcp::socket m_Socket;
 			boost::asio::ip::tcp::endpoint m_RemoteEndpoint;
-			bool m_IsEstablished, m_IsTerminated;
+			std::atomic<bool> m_IsEstablished, m_IsTerminated;
 
 			std::unique_ptr<NTCP2Establisher> m_Establisher;
 			// data phase
@@ -263,10 +266,16 @@ namespace transport
 			{
 				public:
 
-					EstablisherService (): RunnableServiceWithWork ("NTCP2e") {};
+					EstablisherService (uint32_t seed): RunnableServiceWithWork ("NTCP2e"),
+						m_Rng (seed) {};
 					auto& GetService () { return GetIOService (); };
+					std::mt19937& GetRng () { return m_Rng; };
 					void Start () { StartIOService (); };
 					void Stop () { StopIOService (); };
+
+				private:
+
+					std::mt19937 m_Rng;
 			};
 
 		public:
@@ -286,6 +295,7 @@ namespace transport
 			auto& GetService () { return GetIOService (); };
 			auto& GetEstablisherService () { return m_EstablisherService.GetService (); };
 			std::mt19937& GetRng () { return m_Rng; };
+			std::mt19937& GetEstablisherRng () { return m_EstablisherService.GetRng (); };
 			void AEADChaCha20Poly1305Encrypt (const std::vector<std::pair<uint8_t *, size_t> >& bufs,
 				const uint8_t * key, const uint8_t * nonce, uint8_t * mac);
 			bool AEADChaCha20Poly1305Decrypt (const uint8_t * msg, size_t msgLen, const uint8_t * ad, size_t adLen,

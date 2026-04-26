@@ -67,7 +67,9 @@ namespace client
 				if (m_Nickname.empty ()) // try outbound
 					m_Nickname = (*params)[I2CP_PARAM_OUTBOUND_NICKNAME];
 				// otherwise we set default nickname in Start when we know local address
-				params->Get (I2CP_PARAM_DONT_PUBLISH_LEASESET, m_IsPublic); // override isPublic
+				bool dontPublishLeaseSet = true;
+				if (params->Get (I2CP_PARAM_DONT_PUBLISH_LEASESET, dontPublishLeaseSet))
+					m_IsPublic = !dontPublishLeaseSet; // override isPublic
 				params->Get (I2CP_PARAM_LEASESET_TYPE, m_LeaseSetType);
 				if (m_LeaseSetType == i2p::data::NETDB_STORE_TYPE_ENCRYPTED_LEASESET2)
 				{
@@ -140,7 +142,7 @@ namespace client
 		LoadTags ();
 		m_Pool->SetLocalDestination (shared_from_this ());
 		m_Pool->SetActive (true);
-		m_CleanupTimer.expires_from_now (boost::posix_time::seconds (DESTINATION_CLEANUP_TIMEOUT));
+		m_CleanupTimer.expires_after (std::chrono::seconds (DESTINATION_CLEANUP_TIMEOUT));
 		m_CleanupTimer.async_wait (std::bind (&LeaseSetDestination::HandleCleanupTimer,
 			shared_from_this (), std::placeholders::_1));
 	}
@@ -159,10 +161,12 @@ namespace client
 		CleanUp (); // GarlicDestination
 	}
 
-	bool LeaseSetDestination::Reconfigure(const i2p::util::Mapping& params)
-	{
-		params.Get (I2CP_PARAM_DONT_PUBLISH_LEASESET, m_IsPublic);
 
+	bool LeaseSetDestination::Reconfigure (const i2p::util::Mapping& params)
+	{
+		bool dontPublishLeaseSet = !m_IsPublic;
+		params.Get(I2CP_PARAM_DONT_PUBLISH_LEASESET, dontPublishLeaseSet);
+		m_IsPublic = !dontPublishLeaseSet;
 		auto numTags = GetNumTags ();
 		params.Get (I2CP_PARAM_TAGS_TO_SEND, numTags);
 		auto numRatchetInboundTags = GetNumRatchetInboundTags ();
@@ -580,7 +584,7 @@ namespace client
 			m_ExcludedFloodfills.clear ();
 			m_PublishReplyToken = 0;
 			// schedule verification
-			m_PublishVerificationTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_VERIFICATION_TIMEOUT +
+			m_PublishVerificationTimer.expires_after (std::chrono::seconds(PUBLISH_VERIFICATION_TIMEOUT +
 				GetRng ()() % PUBLISH_VERIFICATION_TIMEOUT_VARIANCE));
 			m_PublishVerificationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishVerificationTimer,
 			shared_from_this (), std::placeholders::_1));
@@ -615,7 +619,7 @@ namespace client
 		{
 			LogPrint (eLogDebug, "Destination: Publishing LeaseSet is too fast. Wait for ", PUBLISH_MIN_INTERVAL, " seconds");
 			m_PublishDelayTimer.cancel ();
-			m_PublishDelayTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_MIN_INTERVAL));
+			m_PublishDelayTimer.expires_after (std::chrono::seconds(PUBLISH_MIN_INTERVAL));
 			m_PublishDelayTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishDelayTimer,
 				shared_from_this (), std::placeholders::_1));
 			return;
@@ -661,7 +665,7 @@ namespace client
 				m_PublishReplyToken = 1; // dummy non-zero value
 				// try again after a while
 				LogPrint (eLogInfo, "Destination: Can't publish LeasetSet because destination is not ready. Try publishing again after ", PUBLISH_CONFIRMATION_TIMEOUT, " milliseconds");
-				m_PublishConfirmationTimer.expires_from_now (boost::posix_time::milliseconds(PUBLISH_CONFIRMATION_TIMEOUT));
+				m_PublishConfirmationTimer.expires_after (std::chrono::milliseconds(PUBLISH_CONFIRMATION_TIMEOUT));
 				m_PublishConfirmationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishConfirmationTimer,
 					shared_from_this (), std::placeholders::_1));
 				return;
@@ -680,7 +684,7 @@ namespace client
 						s->HandlePublishConfirmationTimer (boost::system::error_code());
 					});
 			};
-		m_PublishConfirmationTimer.expires_from_now (boost::posix_time::milliseconds(PUBLISH_CONFIRMATION_TIMEOUT));
+		m_PublishConfirmationTimer.expires_after (std::chrono::milliseconds(PUBLISH_CONFIRMATION_TIMEOUT));
 		m_PublishConfirmationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishConfirmationTimer,
 			shared_from_this (), std::placeholders::_1));
 		outbound->SendTunnelDataMsgTo (floodfill->GetIdentHash (), 0, msg);
@@ -720,7 +724,7 @@ namespace client
 						{
 							// we got latest LeasetSet
 							LogPrint (eLogDebug, "Destination: Published LeaseSet verified for ", s->GetIdentHash().ToBase32());
-							s->m_PublishVerificationTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_REGULAR_VERIFICATION_INTERNAL));
+							s->m_PublishVerificationTimer.expires_after (std::chrono::seconds(PUBLISH_REGULAR_VERIFICATION_INTERNAL));
 							s->m_PublishVerificationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishVerificationTimer, s, std::placeholders::_1));
 							return;
 						}
@@ -887,7 +891,7 @@ namespace client
 						nextFloodfill->GetIdentHash (), 0, msg
 					}
 				});
-			request->requestTimeoutTimer.expires_from_now (boost::posix_time::milliseconds(LEASESET_REQUEST_TIMEOUT));
+			request->requestTimeoutTimer.expires_after (std::chrono::milliseconds(LEASESET_REQUEST_TIMEOUT));
 			request->requestTimeoutTimer.async_wait (std::bind (&LeaseSetDestination::HandleRequestTimoutTimer,
 				shared_from_this (), std::placeholders::_1, dest));
 		}
@@ -941,7 +945,7 @@ namespace client
 			CleanupExpiredTags ();
 			CleanupRemoteLeaseSets ();
 			CleanupDestination ();
-			m_CleanupTimer.expires_from_now (boost::posix_time::seconds (DESTINATION_CLEANUP_TIMEOUT +
+			m_CleanupTimer.expires_after (std::chrono::seconds (DESTINATION_CLEANUP_TIMEOUT +
 				GetRng ()() % DESTINATION_CLEANUP_TIMEOUT_VARIANCE));
 			m_CleanupTimer.async_wait (std::bind (&LeaseSetDestination::HandleCleanupTimer,
 				shared_from_this (), std::placeholders::_1));
@@ -1130,6 +1134,23 @@ namespace client
 		}
 		LeaseSetDestination::Stop ();
 		LogPrint(eLogDebug, "Destination: -> Stopping done");
+	}
+
+	void ClientDestination::SetPrivateKeys (const i2p::data::PrivateKeys& keys)
+	{
+		if (m_StreamingDestination) m_StreamingDestination->Stop (); // close all streams
+		CleanUp (); // delete sessions and tags
+		auto pool = GetTunnelPool ();
+		if (pool) pool->DetachTunnels ();
+		m_Keys = keys;
+		// update static keys
+		for (auto it: m_EncryptionKeys)
+			if (it.second)
+			{
+				it.second->GenerateKeys ();
+				it.second->CreateDecryptor ();
+			}
+		if (m_StreamingDestination) m_StreamingDestination->Start ();
 	}
 
 	void ClientDestination::HandleDataMessage (const uint8_t * buf, size_t len,
@@ -1473,7 +1494,7 @@ namespace client
 					if (it.first == m_PreferredCryptoType)
 						preferredSection = it.second;
 					else
-						keySections.push_back (it.second);
+						keySections.push_front (it.second); // higher key type should appear first
 			}
 			if (preferredSection)
 				keySections.push_front (preferredSection); // make preferred first

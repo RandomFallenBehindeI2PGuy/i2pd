@@ -123,7 +123,7 @@ namespace client
 		// start UDP cleanup
 		if (!m_ServerForwards.empty ())
 		{
-			m_CleanupUDPTimer.reset (new boost::asio::deadline_timer(m_SharedLocalDestination->GetService ()));
+			m_CleanupUDPTimer.reset (new boost::asio::steady_timer(m_SharedLocalDestination->GetService ()));
 			ScheduleCleanupUDP();
 		}
 	}
@@ -369,25 +369,39 @@ namespace client
 
 	void ClientContext::AddLocalDestination (std::shared_ptr<ClientDestination> localDestination)
 	{
-		std::unique_lock<std::mutex> l(m_DestinationsMutex);
-		m_Destinations[localDestination->GetIdentHash ()] = localDestination;
-		localDestination->Start ();
+		bool added = false;
+		{
+			std::unique_lock<std::mutex> l(m_DestinationsMutex);
+			added = m_Destinations.emplace (localDestination->GetIdentHash (), localDestination).second;
+		}
+		if (added)
+			localDestination->Start ();
 	}
 
 	void ClientContext::DeleteLocalDestination (std::shared_ptr<ClientDestination> destination)
 	{
 		if (!destination) return;
-		auto it = m_Destinations.find (destination->GetIdentHash ());
-		if (it != m_Destinations.end ())
+		bool removed = false;
 		{
-			auto d = it->second;
-			{
-				std::unique_lock<std::mutex> l(m_DestinationsMutex);
-				m_Destinations.erase (it);
-			}
-			d->Stop ();
+			std::unique_lock<std::mutex> l(m_DestinationsMutex);
+			removed = m_Destinations.erase (destination->GetIdentHash ()) > 0;
 		}
+		if (removed)
+			destination->Stop ();
 	}
+
+	bool ClientContext::ReplaceLocalDestinationHash (const i2p::data::IdentHash& oldIdentHash, const i2p::data::IdentHash& newIdentHash)
+	{
+		std::unique_lock<std::mutex> l(m_DestinationsMutex);
+		auto it = m_Destinations.find (oldIdentHash);
+		if (it == m_Destinations.end ()) return false;
+		auto dest = it->second;
+		if (!dest) return false;
+		m_Destinations.erase (it);
+		m_Destinations.emplace (newIdentHash, dest);
+		return true;
+	}
+
 
 	std::shared_ptr<ClientDestination> ClientContext::CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic,
 		const i2p::util::Mapping * params)
@@ -615,9 +629,7 @@ namespace client
 					std::string address = section.second.get<std::string> (I2P_CLIENT_TUNNEL_ADDRESS, "127.0.0.1");
 					uint16_t destinationPort = section.second.get<uint16_t> (I2P_CLIENT_TUNNEL_DESTINATION_PORT, 0);
 					i2p::data::SigningKeyType sigType = section.second.get (I2P_CLIENT_TUNNEL_SIGNATURE_TYPE, i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519);
-#if !OPENSSL_PQ
-					if (sigType >= i2p::data::SIGNING_KEY_TYPE_MLDSA44) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
-#endif
+					if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 					i2p::data::CryptoKeyType cryptoType = section.second.get (I2P_CLIENT_TUNNEL_CRYPTO_TYPE, i2p::data::CRYPTO_KEY_TYPE_ELGAMAL);
 					// I2CP
 					i2p::util::Mapping options;
@@ -737,6 +749,12 @@ namespace client
 							clientTunnel->SetConnectTimeout(timeout);
 							LogPrint(eLogInfo, "Clients: I2P Client tunnel connect timeout set to ", timeout);
 						}
+						uint64_t closeIdleTime = section.second.get (boost::property_tree::ptree::path_type (I2P_CLIENT_TUNNEL_CLOSE_IDLE_TIME, '/'), 0);
+						if (closeIdleTime)
+						{
+							clientTunnel->SetCloseIdleTime(closeIdleTime);
+							clientTunnel->SetNewDestOnResume(section.second.get (boost::property_tree::ptree::path_type (I2P_CLIENT_TUNNEL_NEW_DEST_ON_RESUME, '/'), false));
+						}
 
 						auto ins = m_ClientTunnels.insert (std::make_pair (clientEndpoint, clientTunnel));
 						if (ins.second)
@@ -776,9 +794,7 @@ namespace client
 						accessList = section.second.get<std::string> (I2P_SERVER_TUNNEL_WHITE_LIST, "");
 					bool gzip = section.second.get (I2P_SERVER_TUNNEL_GZIP, false);
 					i2p::data::SigningKeyType sigType = section.second.get (I2P_SERVER_TUNNEL_SIGNATURE_TYPE, i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519);
-#if !OPENSSL_PQ
-					if (sigType >= i2p::data::SIGNING_KEY_TYPE_MLDSA44) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
-#endif
+					if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 					i2p::data::CryptoKeyType cryptoType = section.second.get (I2P_CLIENT_TUNNEL_CRYPTO_TYPE, i2p::data::CRYPTO_KEY_TYPE_ELGAMAL);
 
 					std::string address = section.second.get<std::string> (I2P_SERVER_TUNNEL_ADDRESS, "");
@@ -944,9 +960,7 @@ namespace client
 			if (httpAddresshelper)
 				i2p::config::GetOption("addressbook.enabled", httpAddresshelper); // addresshelper is not supported without address book
 			i2p::data::SigningKeyType sigType; i2p::config::GetOption("httpproxy.signaturetype", sigType);
-#if !OPENSSL_PQ
-			if (sigType >= i2p::data::SIGNING_KEY_TYPE_MLDSA44) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
-#endif
+			if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 			LogPrint(eLogInfo, "Clients: Starting HTTP Proxy at ", httpProxyAddr, ":", httpProxyPort);
 			if (httpProxyKeys == "shareddest")
 			{
@@ -971,6 +985,13 @@ namespace client
 			{
 				m_HttpProxy = new i2p::proxy::HTTPProxy("HTTP Proxy", httpProxyAddr, httpProxyPort,
 					httpOutProxyURL, httpAddresshelper, httpSendUserAgent, localDestination);
+				uint64_t closeIdleTime; i2p::config::GetOption("httpproxy.i2cp.closeIdleTime", closeIdleTime);
+				if (closeIdleTime)
+				{
+					m_HttpProxy->SetCloseIdleTime(closeIdleTime);
+					bool newDestOnResume; i2p::config::GetOption("httpproxy.i2cp.newDestOnResume", newDestOnResume);
+					m_HttpProxy->SetNewDestOnResume(newDestOnResume);
+				}
 				m_HttpProxy->Start();
 			}
 			catch (std::exception& e)
@@ -996,9 +1017,7 @@ namespace client
 			std::string socksOutProxyAddr;     i2p::config::GetOption("socksproxy.outproxy",         socksOutProxyAddr);
 			uint16_t    socksOutProxyPort;     i2p::config::GetOption("socksproxy.outproxyport",     socksOutProxyPort);
 			i2p::data::SigningKeyType sigType; i2p::config::GetOption("socksproxy.signaturetype",    sigType);
-#if !OPENSSL_PQ
-			if (sigType >= i2p::data::SIGNING_KEY_TYPE_MLDSA44) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
-#endif
+			if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 			LogPrint(eLogInfo, "Clients: Starting SOCKS Proxy at ", socksProxyAddr, ":", socksProxyPort);
 			if (socksProxyKeys == "shareddest")
 			{
@@ -1028,6 +1047,13 @@ namespace client
 			{
 				m_SocksProxy = new i2p::proxy::SOCKSProxy("SOCKS", socksProxyAddr, socksProxyPort,
 					socksOutProxy, socksOutProxyAddr, socksOutProxyPort, localDestination);
+				uint64_t closeIdleTime; i2p::config::GetOption("socksproxy.i2cp.closeIdleTime", closeIdleTime);
+				if (closeIdleTime)
+				{
+					m_SocksProxy->SetCloseIdleTime(closeIdleTime);
+					bool newDestOnResume; i2p::config::GetOption("socksproxy.i2cp.newDestOnResume", newDestOnResume);
+					m_SocksProxy->SetNewDestOnResume(newDestOnResume);
+				}
 				m_SocksProxy->Start();
 			}
 			catch (std::exception& e)
@@ -1043,7 +1069,7 @@ namespace client
 		if (m_CleanupUDPTimer)
 		{
 			// schedule cleanup in 17 seconds
-			m_CleanupUDPTimer->expires_from_now (boost::posix_time::seconds (17));
+			m_CleanupUDPTimer->expires_after (std::chrono::seconds (17));
 			m_CleanupUDPTimer->async_wait(std::bind(&ClientContext::CleanupUDP, this, std::placeholders::_1));
 		}
 	}

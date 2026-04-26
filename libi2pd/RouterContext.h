@@ -153,7 +153,7 @@ namespace garlic
 			void UpdatePort (int port); // called from Daemon
 			void UpdateAddress (const boost::asio::ip::address& host); // called from SSU2 or Daemon
 			void PublishNTCP2Address (int port, bool publish, bool v4, bool v6, bool ygg, int version);
-			void PublishSSU2Address (int port, bool publish, bool v4, bool v6);
+			void PublishSSU2Address (int port, bool publish, bool v4, bool v6, int version);
 			bool AddSSU2Introducer (const i2p::data::RouterInfo::Introducer& introducer, bool v4);
 			void RemoveSSU2Introducer (const i2p::data::IdentHash& h, bool v4);
 			void UpdateSSU2Introducer (const i2p::data::IdentHash& h, bool v4, uint32_t iTag, uint32_t iExp);
@@ -264,14 +264,14 @@ namespace garlic
 			i2p::crypto::NoiseSymmetricState m_InitialNoiseState, m_CurrentNoiseState;
 			// publish
 			std::unique_ptr<RouterService> m_Service;
-			std::unique_ptr<boost::asio::deadline_timer> m_PublishTimer, m_CongestionUpdateTimer, m_CleanupTimer;
+			std::unique_ptr<boost::asio::steady_timer> m_PublishTimer, m_CongestionUpdateTimer, m_CleanupTimer;
 			std::unordered_set<i2p::data::IdentHash> m_PublishExcluded;
 			uint32_t m_PublishReplyToken;
 			bool m_IsHiddenMode; // not publish
 			mutable std::mutex m_RouterInfoMutex;
 			std::shared_ptr<i2p::data::RouterInfo::Buffer> m_SaveBuffer;
 			std::mutex m_SaveBufferMutex; // TODO: make m_SaveBuffer atomic
-			std::atomic<bool> m_IsSaving;
+			std::atomic_flag m_IsSaving;
 	};
 
 	extern RouterContext context;

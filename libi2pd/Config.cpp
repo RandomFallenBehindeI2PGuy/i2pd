@@ -146,6 +146,8 @@ namespace config {
 			("httpproxy.i2p.streaming.maxInboundSpeed", value<std::string>()->default_value("1730000000"), "Max inbound speed of HTTP proxy stream in bytes/sec")
 			("httpproxy.i2p.streaming.profile", value<std::string>()->default_value("1"), "HTTP Proxy bandwidth usage profile. 1 - bulk(high), 2- interactive(low)")
 			("httpproxy.i2p.streaming.maxWindowSize", value<std::string>()->default_value("512"), "HTTP Proxy stream max window size. 512 by default")
+			("httpproxy.i2cp.closeIdleTime", value<uint64_t>()->default_value(0), "HTTP Proxy idle timeout in milliseconds after which destination stops building tunnels. Disabled by default(0)")
+			("httpproxy.i2cp.newDestOnResume", value<bool>()->default_value(false), "HTTP Proxy generate a new local destination when resuming from idle. false by default")
 		;
 
 		options_description socksproxy("SOCKS Proxy options");
@@ -178,6 +180,8 @@ namespace config {
 			("socksproxy.i2p.streaming.maxInboundSpeed", value<std::string>()->default_value("1730000000"), "Max inbound speed of SOCKS proxy stream in bytes/sec")
 			("socksproxy.i2p.streaming.profile", value<std::string>()->default_value("1"), "SOCKS Proxy bandwidth usage profile. 1 - bulk(high), 2- interactive(low)")
 			("socksproxy.i2p.streaming.maxWindowSize", value<std::string>()->default_value("512"), "SOCKS Proxy stream max window size. 512 by default")
+			("socksproxy.i2cp.closeIdleTime", value<uint64_t>()->default_value(0), "SOCKS Proxy idle timeout in milliseconds after which destination stops building tunnels. Disabled by default(0)")
+			("socksproxy.i2cp.newDestOnResume", value<bool>()->default_value(false), "SOCKS Proxy generate a new local destination when resuming from idle. false by default")
 		;
 
 		options_description shareddest("Shared local destination options");
@@ -271,9 +275,10 @@ namespace config {
 				"https://reseed-pl.i2pd.xyz/,"
 				"https://www2.mk16.de/,"
 			    "https://i2p.novg.net/,"
-            	"https://reseed.stormycloud.org,"
+            	"https://reseed.stormycloud.org/,"
             	"https://reseed.sahil.world/,"
-            	"https://i2p.diyarciftci.xyz/"
+            	"https://i2p.diyarciftci.xyz/,"
+            	"https://bybyh.de/"
 			),                                                            "Reseed URLs, separated by comma")
 			("reseed.yggurls", value<std::string>()->default_value(
 				"http://[324:71e:281a:9ed3::ace]:7070/,"
@@ -326,7 +331,11 @@ namespace config {
 			("ntcp2.port", value<uint16_t>()->default_value(0),            "Port to listen for incoming NTCP2 connections (default: auto)")
 			("ntcp2.addressv6", value<std::string>()->default_value("::"), "Address to publish NTCP2 with")
 			("ntcp2.proxy", value<std::string>()->default_value(""),       "Proxy URL for NTCP2 transport")
+#if OPENSSL_PQ
+			("ntcp2.version", value<int>()->default_value(4),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 4")
+#else
 			("ntcp2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 2")
+#endif
 		;
 
 		options_description ssu2("SSU2 Options");
@@ -339,6 +348,7 @@ namespace config {
 			("ssu2.proxy", value<std::string>()->default_value(""),       "Socks5 proxy URL for SSU2 transport")
 			("ssu2.firewalled4", value<bool>()->default_value(false),     "Set ipv4 network status to Firewalled even if OK (default: disabled)")
 			("ssu2.firewalled6", value<bool>()->default_value(false),     "Set ipv6 network status to Firewalled even if OK (default: disabled)")
+			("ssu2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4 - post quantum (default: 2")
 		;
 
 		options_description nettime("Time sync options");
@@ -358,6 +368,7 @@ namespace config {
 		persist.add_options()
 			("persist.profiles", value<bool>()->default_value(true),       "Persist peer profiles (default: true)")
 			("persist.addressbook", value<bool>()->default_value(true),    "Persist full addresses (default: true)")
+			("persist.netdbinterval", value<int>()->default_value(60),     "NetDb persist interval in seconds (default: 60)")
 		;
 
 		options_description cpuext("CPU encryption extensions options. Deprecated");

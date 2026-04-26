@@ -15,8 +15,8 @@ namespace i2p
 namespace transport
 {
 	SSU2PeerTestSession::SSU2PeerTestSession (SSU2Server& server, uint64_t sourceConnID, uint64_t destConnID):
-		SSU2Session (server, nullptr, nullptr, false),
-		m_MsgNumReceived (0), m_NumResends (0),m_IsConnectedRecently (false), m_IsStatusChanged (false),
+		SSU2Session (server),
+		m_MsgNumReceived (0), m_NumResends (0), m_IsConnectedRecently (false), m_IsStatusChanged (false),
 		m_PeerTestResendTimer (server.GetService ())
 	{
 		if (!sourceConnID) sourceConnID = ~destConnID;
@@ -165,7 +165,7 @@ namespace transport
 		header.h.connID = GetDestConnID (); // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2PeerTest;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = 2; // ver, always 2 even for post-quantum
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (h, header.buf, 16);
@@ -227,7 +227,7 @@ namespace transport
 	{
 		if (m_NumResends < SSU2_PEER_TEST_MAX_NUM_RESENDS)
 		{
-			m_PeerTestResendTimer.expires_from_now (boost::posix_time::milliseconds(
+			m_PeerTestResendTimer.expires_after (std::chrono::milliseconds(
 				SSU2_PEER_TEST_RESEND_INTERVAL + GetServer ().GetRng ()() % SSU2_PEER_TEST_RESEND_INTERVAL_VARIANCE));
 			std::weak_ptr<SSU2PeerTestSession> s(std::static_pointer_cast<SSU2PeerTestSession>(shared_from_this ()));
 			m_PeerTestResendTimer.async_wait ([s, msg](const boost::system::error_code& ecode)
@@ -263,6 +263,10 @@ namespace transport
 		SetState (eSSU2SessionStateHolePunch);
 		SetRemoteEndpoint (remoteEndpoint);
 		SetAddress (addr);
+#if OPENSSL_PQ
+		if (server.GetVersion () > 2) // we support post quantum in config
+			SetVersion (addr->v);
+#endif
 		SetTerminationTimeout (SSU2_RELAY_NONCE_EXPIRATION_TIMEOUT);
 	}
 
@@ -278,7 +282,7 @@ namespace transport
 		header.h.connID = GetDestConnID (); // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2HolePunch;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = GetVersion (); // ver
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (h, header.buf, 16);
@@ -322,7 +326,7 @@ namespace transport
 	{
 		if (m_NumResends < SSU2_HOLE_PUNCH_MAX_NUM_RESENDS)
 		{
-			m_HolePunchResendTimer.expires_from_now (boost::posix_time::milliseconds(
+			m_HolePunchResendTimer.expires_after (std::chrono::milliseconds(
 				SSU2_HOLE_PUNCH_RESEND_INTERVAL + GetServer ().GetRng ()() % SSU2_HOLE_PUNCH_RESEND_INTERVAL_VARIANCE));
 			std::weak_ptr<SSU2HolePunchSession> s(std::static_pointer_cast<SSU2HolePunchSession>(shared_from_this ()));
 			m_HolePunchResendTimer.async_wait ([s](const boost::system::error_code& ecode)

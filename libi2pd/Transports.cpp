@@ -145,7 +145,7 @@ namespace transport
 		{
 			isHighBandwidth = router->IsHighBandwidth ();
 			isEligible =(bool)router->GetCompatibleTransports (true) && // reachable
-				router->GetCongestion () != i2p::data::RouterInfo::eRejectAll && // accepts tunnel
+				router->GetCongestion () < i2p::data::RouterInfo::eHighCongestion && // accepts tunnel and not overloaded
 				router->IsECIES () && router->GetVersion () >= NETDB_MIN_HIGHBANDWIDTH_VERSION; // not too old
 		}
 	}
@@ -184,9 +184,9 @@ namespace transport
 		{
 			m_Service = new boost::asio::io_context ();
 			m_Work = new boost::asio::executor_work_guard<boost::asio::io_context::executor_type> (m_Service->get_executor ());
-			m_PeerCleanupTimer = new boost::asio::deadline_timer (*m_Service);
-			m_PeerTestTimer = new boost::asio::deadline_timer (*m_Service);
-			m_UpdateBandwidthTimer = new boost::asio::deadline_timer (*m_Service);
+			m_PeerCleanupTimer = new boost::asio::steady_timer (*m_Service);
+			m_PeerTestTimer = new boost::asio::steady_timer (*m_Service);
+			m_UpdateBandwidthTimer = new boost::asio::steady_timer (*m_Service);
 			m_BanListCleanupTimer = std::make_unique<boost::asio::steady_timer>(*m_Service);
 		}
 
@@ -197,9 +197,10 @@ namespace transport
 		m_IsRunning = true;
 		m_Thread = new std::thread (std::bind (&Transports::Run, this));
 		std::string ntcp2proxy; i2p::config::GetOption("ntcp2.proxy", ntcp2proxy);
-        int ntcp2version = 2;
+        int ntcp2version = 2, ssu2version = 2;
 #if OPENSSL_PQ
         i2p::config::GetOption("ntcp2.version", ntcp2version);
+        i2p::config::GetOption("ssu2.version", ssu2version);
 #endif
 		i2p::http::URL proxyurl;
 		// create NTCP2. TODO: move to acceptor
@@ -237,6 +238,7 @@ namespace transport
 		if (enableSSU2)
 		{
 			m_SSU2Server = new SSU2Server ();
+			m_SSU2Server->SetVersion (ssu2version);
 			std::string ssu2proxy; i2p::config::GetOption("ssu2.proxy", ssu2proxy);
 			if (!ssu2proxy.empty())
 			{
@@ -327,7 +329,7 @@ namespace transport
 		if (m_SSU2Server) m_SSU2Server->Start ();
 		if (m_SSU2Server) DetectExternalIP ();
 
-		m_PeerCleanupTimer->expires_from_now (boost::posix_time::seconds(5 * SESSION_CREATION_TIMEOUT));
+		m_PeerCleanupTimer->expires_after (std::chrono::seconds(5 * SESSION_CREATION_TIMEOUT));
 		m_PeerCleanupTimer->async_wait (std::bind (&Transports::HandlePeerCleanupTimer, this, std::placeholders::_1));
 
 		uint64_t ts = i2p::util::GetMillisecondsSinceEpoch();
@@ -340,12 +342,12 @@ namespace transport
 		}
 		m_TrafficSamplePtr = TRAFFIC_SAMPLE_COUNT - 1;
 
-		m_UpdateBandwidthTimer->expires_from_now (boost::posix_time::seconds(1));
+		m_UpdateBandwidthTimer->expires_after (std::chrono::seconds(1));
 		m_UpdateBandwidthTimer->async_wait (std::bind (&Transports::HandleUpdateBandwidthTimer, this, std::placeholders::_1));
 
 		if (m_IsNAT)
 		{
-			m_PeerTestTimer->expires_from_now (boost::posix_time::seconds(PEER_TEST_INTERVAL + m_Rng() % PEER_TEST_INTERVAL_VARIANCE));
+			m_PeerTestTimer->expires_after (std::chrono::seconds(PEER_TEST_INTERVAL + m_Rng() % PEER_TEST_INTERVAL_VARIANCE));
 			m_PeerTestTimer->async_wait (std::bind (&Transports::HandlePeerTestTimer, this, std::placeholders::_1));
 		}
 		m_BanListCleanupTimer->expires_after (std::chrono::seconds(BAN_LIST_CLEANUP_INTERVAL + m_Rng () % BAN_LIST_CLEANUP_INTERVAL_VARIANCE));
@@ -434,7 +436,7 @@ namespace transport
 			UpdateBandwidthValues (15, m_InBandwidth15s, m_OutBandwidth15s, m_TransitBandwidth15s);
 			UpdateBandwidthValues (300, m_InBandwidth5m, m_OutBandwidth5m, m_TransitBandwidth5m);
 
-			m_UpdateBandwidthTimer->expires_from_now (boost::posix_time::seconds(1));
+			m_UpdateBandwidthTimer->expires_after (std::chrono::seconds(1));
 			m_UpdateBandwidthTimer->async_wait (std::bind (&Transports::HandleUpdateBandwidthTimer, this, std::placeholders::_1));
 		}
 	}
@@ -828,8 +830,8 @@ namespace transport
 						testDelay += PEER_TEST_DELAY_INTERVAL + m_Rng() % PEER_TEST_DELAY_INTERVAL_VARIANCE;
 						if (m_Service)
 						{
-							auto delayTimer = std::make_shared<boost::asio::deadline_timer>(*m_Service);
-							delayTimer->expires_from_now (boost::posix_time::milliseconds (testDelay));
+							auto delayTimer = std::make_shared<boost::asio::steady_timer>(*m_Service);
+							delayTimer->expires_after (std::chrono::milliseconds (testDelay));
 							delayTimer->async_wait (
 								[this, router, delayTimer](const boost::system::error_code& ecode)
 								{
@@ -866,8 +868,8 @@ namespace transport
 						testDelay += PEER_TEST_DELAY_INTERVAL + m_Rng() % PEER_TEST_DELAY_INTERVAL_VARIANCE;
 						if (m_Service)
 						{
-							auto delayTimer = std::make_shared<boost::asio::deadline_timer>(*m_Service);
-							delayTimer->expires_from_now (boost::posix_time::milliseconds (testDelay));
+							auto delayTimer = std::make_shared<boost::asio::steady_timer>(*m_Service);
+							delayTimer->expires_after (std::chrono::milliseconds (testDelay));
 							delayTimer->async_wait (
 								[this, router, delayTimer](const boost::system::error_code& ecode)
 								{
@@ -894,10 +896,12 @@ namespace transport
 		m_X25519KeysPairSupplier.Return (pair);
 	}
 
-	void Transports::PeerConnected (std::shared_ptr<TransportSession> session)
+	void Transports::PeerConnected (std::weak_ptr<TransportSession> session)
 	{
-		boost::asio::post (*m_Service, [session, this]()
+		boost::asio::post (*m_Service, [weakSession = std::move(session), this]()
 		{
+			auto session = weakSession.lock();
+			if (!session) return;
 			auto remoteIdentity = session->GetRemoteIdentity ();
 			if (!remoteIdentity) return;
 			auto ident = remoteIdentity->GetIdentHash ();
@@ -954,10 +958,7 @@ namespace transport
 					return;
 				}
 				if (!session->IsOutgoing ()) // incoming
-				{
-					std::list<std::shared_ptr<I2NPMessage> > msgs{ CreateDatabaseStoreMsg () };
-					session->SendI2NPMessages (msgs); // send DatabaseStore
-				}
+					session->SendLocalRouterInfo (); // send DatabaseStore
 				auto r = i2p::data::netdb.FindRouter (ident); // router should be in netdb after SessionConfirmed
 				i2p::data::UpdateRouterProfile (ident,
 					[](std::shared_ptr<i2p::data::RouterProfile> profile)
@@ -971,13 +972,25 @@ namespace transport
 				std::lock_guard<std::mutex> l(m_PeersMutex);
 				m_Peers.emplace (ident, peer);
 			}
+			if (IsCheckReserved ())
+			{
+				auto addr = GetNetworkAddress (session);
+				if (!addr.is_unspecified ())
+				{
+					std::lock_guard<std::mutex> l( m_ConnectedNetworksMutex);
+					auto [it1, inserted] = m_ConnectedNetworks.try_emplace (addr, 0);
+					it1->second++;
+				}
+			}
 		});
 	}
 
-	void Transports::PeerDisconnected (std::shared_ptr<TransportSession> session)
+	void Transports::PeerDisconnected (std::weak_ptr<TransportSession> session)
 	{
-		boost::asio::post (*m_Service, [session, this]()
+		boost::asio::post (*m_Service, [weakSession = std::move(session), this]()
 		{
+			auto session = weakSession.lock();
+			if (!session) return;
 			auto remoteIdentity = session->GetRemoteIdentity ();
 			if (!remoteIdentity) return;
 			auto ident = remoteIdentity->GetIdentHash ();
@@ -1007,6 +1020,21 @@ namespace transport
 					}
 				}
 			}
+			if (IsCheckReserved ())
+			{
+				auto addr = GetNetworkAddress (session);
+				if (!addr.is_unspecified ())
+				{
+					std::lock_guard<std::mutex> l( m_ConnectedNetworksMutex);
+					auto it1 = m_ConnectedNetworks.find (addr);
+					if (it1 != m_ConnectedNetworks.end ())
+					{
+						it1->second--;
+						if (it1->second <= 0)
+							m_ConnectedNetworks.erase (it1);
+					}
+				}
+			}
 		});
 	}
 
@@ -1019,6 +1047,20 @@ namespace transport
 		auto it = m_Peers.find (ident);
 		return it != m_Peers.end ();
 #endif
+	}
+
+	void Transports::UpdatePeerParams (std::shared_ptr<const i2p::data::RouterInfo> r)
+	{
+		if (!r) return;
+		std::shared_ptr<Peer> peer;
+		{
+			std::lock_guard<std::mutex> l(m_PeersMutex);
+			auto it = m_Peers.find (r->GetIdentHash ());
+			if (it != m_Peers.end ())
+				peer = it->second;
+		}
+		if (peer)
+			peer->UpdateParams (r);
 	}
 
 	void Transports::HandlePeerCleanupTimer (const boost::system::error_code& ecode)
@@ -1067,7 +1109,7 @@ namespace transport
 			// if still testing or unknown, repeat peer test
 			if (ipv4Testing || ipv6Testing)
 				PeerTest (ipv4Testing, ipv6Testing);
-			m_PeerCleanupTimer->expires_from_now (boost::posix_time::seconds(2 * SESSION_CREATION_TIMEOUT + m_Rng() % SESSION_CREATION_TIMEOUT));
+			m_PeerCleanupTimer->expires_after (std::chrono::seconds(2 * SESSION_CREATION_TIMEOUT + m_Rng() % SESSION_CREATION_TIMEOUT));
 			m_PeerCleanupTimer->async_wait (std::bind (&Transports::HandlePeerCleanupTimer, this, std::placeholders::_1));
 		}
 	}
@@ -1077,7 +1119,7 @@ namespace transport
 		if (ecode != boost::asio::error::operation_aborted)
 		{
 			PeerTest ();
-			m_PeerTestTimer->expires_from_now (boost::posix_time::seconds(PEER_TEST_INTERVAL + m_Rng() % PEER_TEST_INTERVAL_VARIANCE));
+			m_PeerTestTimer->expires_after (std::chrono::seconds(PEER_TEST_INTERVAL + m_Rng() % PEER_TEST_INTERVAL_VARIANCE));
 			m_PeerTestTimer->async_wait (std::bind (&Transports::HandlePeerTestTimer, this, std::placeholders::_1));
 		}
 	}
@@ -1202,13 +1244,27 @@ namespace transport
 	std::shared_ptr<const i2p::data::RouterInfo> Transports::GetRandomPeer (bool isHighBandwidth) const
 	{
 		return GetRandomPeer (
-			[isHighBandwidth](std::shared_ptr<const Peer> peer)->bool
+			[isHighBandwidth, this](std::shared_ptr<const Peer> peer)->bool
 			{
-				// connected, not overloaded and not slow
-				return !peer->router && peer->IsConnected () && peer->isEligible &&
-					peer->sessions.front ()->GetSendQueueSize () <= PEER_ROUTER_INFO_OVERLOAD_QUEUE_SIZE &&
-					!peer->sessions.front ()->IsSlow () && !peer->sessions.front ()->IsBandwidthExceeded (peer->isHighBandwidth) &&
-					(!isHighBandwidth || peer->isHighBandwidth);
+				// check if connected and high bandwidth if required
+				if (peer->router || !peer->IsConnected () || !peer->isEligible ||
+					peer->sessions.empty () || (isHighBandwidth && !peer->isHighBandwidth)) return false;
+				auto session = peer->sessions.front ();
+				// check if session not overloaded, slow or bandwidth exceeded
+				if (session->GetSendQueueSize () > PEER_ROUTER_INFO_OVERLOAD_QUEUE_SIZE ||
+					session->IsSlow () || session->IsBandwidthExceeded (peer->isHighBandwidth)) return false;
+				if (IsCheckReserved ())
+				{
+					// check if max num connections from subnet is not exceeded
+					auto addr = GetNetworkAddress (session);
+					if (!addr.is_unspecified ())
+					{
+						std::lock_guard<std::mutex> l( m_ConnectedNetworksMutex);
+						auto it = m_ConnectedNetworks.find (addr);
+						if (it != m_ConnectedNetworks.end () && it->second > MAX_NUM_CONNECTIONS_FROM_SUBNET_FOR_PEER) return false;
+					}
+				}
+				return true;
 			});
 	}
 
@@ -1349,6 +1405,53 @@ namespace transport
 		return m_BanList.emplace (addr, ts).second;
 	}
 
+	boost::asio::ip::address Transports::GetNetworkAddress (const boost::asio::ip::address& addr) const
+	{
+		if (!addr.is_unspecified ())
+		{
+			if (addr.is_v4 ())
+				return boost::asio::ip::network_v4 (addr.to_v4 (), 24).network (); // /24
+			else
+			{
+				if (i2p::util::net::IsYggdrasilAddress (addr))
+				{
+					// change to 2xx range
+					auto bytes = addr.to_v6 ().to_bytes ();
+					bytes[0] = 0x02;
+					return  boost::asio::ip::network_v6 (boost::asio::ip::address_v6 (bytes), 64).network (); // /64
+				}
+				return boost::asio::ip::network_v6 (addr.to_v6 (), 56).network (); // /56
+			}
+		}
+		return boost::asio::ip::address ();
+	}
+
+	boost::asio::ip::address Transports::GetNetworkAddress (std::shared_ptr<TransportSession> session) const
+	{
+		if (session)
+			return GetNetworkAddress (session->GetRemoteAddress ());
+		return boost::asio::ip::address ();
+	}
+
+	bool Transports::IsTooManyConnectionsFromSubnet (std::shared_ptr<const i2p::data::RouterInfo> r) const
+	{
+		if (!r || !IsCheckReserved ()) return false;
+		auto addresses = r->GetAddresses ();
+		if (!addresses) return false;
+		for (auto& address : *addresses)
+			if (address && !address->host.is_unspecified ())
+			{
+				auto networkAddr = GetNetworkAddress (address->host);
+				if (!networkAddr.is_unspecified ())
+				{
+					std::lock_guard<std::mutex> l( m_ConnectedNetworksMutex);
+					auto it = m_ConnectedNetworks.find (networkAddr);
+					if (it != m_ConnectedNetworks.end () && it->second > MAX_NUM_CONNECTIONS_FROM_SUBNET_FOR_PEER) return true;
+				}
+			}
+		return false;
+	}
+
 	void InitAddressFromIface ()
 	{
 		bool ipv6; i2p::config::GetOption("ipv6", ipv6);
@@ -1409,8 +1512,13 @@ namespace transport
 
 		if (ipv6 &&	i2p::util::net::GetClearnetIPV6Address ().is_unspecified ())
 		{
-			LogPrint(eLogWarning, "Transports: Clearnet ipv6 not found. Disabled");
-			ipv6 = false;
+			std::string ntcp2proxy; i2p::config::GetOption("ntcp2.proxy", ntcp2proxy);
+			std::string ssu2proxy; i2p::config::GetOption("ssu2.proxy", ssu2proxy);
+			if (ntcp2proxy.empty () && ssu2proxy.empty ())
+			{
+				LogPrint(eLogWarning, "Transports: Clearnet ipv6 not found. Disabled");
+				ipv6 = false;
+			}
 		}
 
 		if (!i2p::config::IsDefault("port"))
@@ -1464,14 +1572,18 @@ namespace transport
 			ssu2 = false; // don't enable ssu2 for yggdrasil only router
 		if (ssu2)
 		{
+			int ssu2version = 2;
+#if OPENSSL_PQ
+			i2p::config::GetOption("ssu2.version", ssu2version);
+#endif
 			uint16_t ssu2port; i2p::config::GetOption("ssu2.port", ssu2port);
 			if (!ssu2port && port) ssu2port = port;
 			bool published = false;
 			if (!stan) i2p::config::GetOption("ssu2.published", published);
 			if (published)
-				i2p::context.PublishSSU2Address (ssu2port, true, ipv4, ipv6); // publish
+				i2p::context.PublishSSU2Address (ssu2port, true, ipv4, ipv6, ssu2version); // publish
 			else
-				i2p::context.PublishSSU2Address (ssu2port, false, ipv4, ipv6); // unpublish
+				i2p::context.PublishSSU2Address (ssu2port, false, ipv4, ipv6, ssu2version); // unpublish
 		}
 		if (stan)
 			i2p::context.SetStatus (eRouterStatusStan);

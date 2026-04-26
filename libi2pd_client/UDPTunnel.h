@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2025, The PurpleI2P Project
+* Copyright (c) 2013-2026, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -32,57 +32,59 @@ namespace client
 	const uint64_t I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL = 100; // in milliseconds
 	const uint64_t I2P_UDP_MAX_UNACKED_DATAGRAM_TIME = 8000; // in milliseconds
 	const size_t I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS = 500;
-	
+
 	/** max size for i2p udp */
 	const size_t I2P_UDP_MAX_MTU = 64*1024;
 
-	struct UDPConnection  
-	{
-		uint32_t m_NextSendPacketNum = 1, m_LastReceivedPacketNum = 0;
-		std::list<std::pair<uint32_t, uint64_t> > m_UnackedDatagrams; // list of sent but not acked repliable datagrams(seqn, timestamp) in ascending order
-		uint64_t m_RTT = 0; // milliseconds
-	
-		boost::asio::deadline_timer m_AckTimer;
-		uint32_t m_AckTimerSeqn = 0;
-		bool m_IsSendingAllowed = true;
-		bool m_IsFirstPacket = true;
-	
-		UDPConnection (boost::asio::io_context& service): m_AckTimer (service) {};
-		virtual ~UDPConnection () { Stop (); };
-		virtual void Start () {};
-		virtual void Stop ();
-	
-		void Acked (uint32_t seqn);
-		void ScheduleAckTimer (uint32_t seqn);
-		void DeleteExpiredUnackedDatagrams ();
-	
-		virtual std::shared_ptr<i2p::datagram::DatagramSession> GetDatagramSession () = 0;
-		virtual i2p::datagram::DatagramDestination * GetDatagramDestination () const = 0;
-	};
-	
-	struct UDPSession: public UDPConnection // for server side
+	struct UDPConnection
 	{
 		i2p::datagram::DatagramDestination * m_Destination;
 		std::weak_ptr<i2p::datagram::DatagramSession> m_LastDatagramSession;
-		boost::asio::ip::udp::socket IPSocket;
+		uint64_t m_LastRepliableDatagramTime; // milliseconds
 		i2p::data::IdentHash Identity;
+		bool isIdentity = false;
+		uint32_t m_NextSendPacketNum = 1, m_LastReceivedPacketNum = 0;
+		std::list<std::pair<uint32_t, uint64_t> > m_UnackedDatagrams; // list of sent but not acked repliable datagrams(seqn, timestamp) in ascending order
+		uint64_t m_RTT = 0; // milliseconds
+
+		boost::asio::steady_timer m_AckTimer;
+		uint32_t m_AckTimerSeqn = 0;
+		bool m_IsSendingAllowed = true;
+		bool m_IsFirstPacket = true;
+
+		UDPConnection (boost::asio::io_context& service, i2p::datagram::DatagramDestination * destination):
+			m_Destination (destination), m_LastRepliableDatagramTime (0), m_AckTimer (service) {};
+		void SetIdentity (const i2p::data::IdentHash& ident) { Identity = ident; isIdentity = true; };
+
+		virtual ~UDPConnection () { Stop (); };
+		virtual void Start () {};
+		virtual void Stop ();
+
+		void Acked (uint32_t seqn);
+		void ScheduleAckTimer (uint32_t seqn);
+		void DeleteExpiredUnackedDatagrams ();
+
+		std::shared_ptr<i2p::datagram::DatagramSession> GetDatagramSession ();
+	};
+
+	struct UDPSession: public UDPConnection // for server side
+	{
+		boost::asio::ip::udp::socket IPSocket;
 		boost::asio::ip::udp::endpoint FromEndpoint;
 		boost::asio::ip::udp::endpoint SendEndpoint;
-		uint64_t LastActivity, LastRepliableDatagramTime; // milliseconds
+		uint64_t LastActivity; // milliseconds
 
 		uint16_t LocalPort;
 		uint16_t RemotePort;
 
 		uint8_t m_Buffer[I2P_UDP_MAX_MTU];
-	
+
 		UDPSession(boost::asio::ip::udp::endpoint localEndpoint,
 			const std::shared_ptr<i2p::client::ClientDestination> & localDestination,
 			const boost::asio::ip::udp::endpoint& remote, const i2p::data::IdentHash& ident,
 			uint16_t ourPort, uint16_t theirPort);
 		void HandleReceived(const boost::system::error_code & ecode, std::size_t len);
 		void Receive();
-		std::shared_ptr<i2p::datagram::DatagramSession> GetDatagramSession () override;
-		i2p::datagram::DatagramDestination * GetDatagramDestination () const override { return m_Destination; } 
 	};
 
 
@@ -132,12 +134,12 @@ namespace client
 
 		private:
 
-			void HandleRecvFromI2P (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, 
+			void HandleRecvFromI2P (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort,
 				const uint8_t * buf, size_t len, const i2p::util::Mapping * options);
 			void HandleRecvFromI2PRaw (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 			UDPSessionPtr ObtainUDPSession (const i2p::data::IdentityEx& from, uint16_t localPort, uint16_t remotePort);
 			uint32_t GetSessionIndex (uint16_t fromPort, uint16_t toPort) const { return ((uint32_t)fromPort << 16) + toPort; }
-			
+
 		private:
 
 			bool m_IsUniqueLocal;
@@ -179,7 +181,7 @@ namespace client
 				m_LocalDest = dest;
 			}
 			const boost::asio::ip::udp::endpoint& GetLocalEndpoint () const { return m_LocalEndpoint; };
-			
+
 			void ExpireStale (const uint64_t delta=I2P_UDP_SESSION_TIMEOUT);
 
 		private:
@@ -187,14 +189,11 @@ namespace client
 			typedef std::pair<boost::asio::ip::udp::endpoint, uint64_t> UDPConvo;
 			void RecvFromLocal ();
 			void HandleRecvFromLocal (const boost::system::error_code & e, std::size_t transferred);
-			void HandleRecvFromI2P (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, 
+			void HandleRecvFromI2P (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort,
 				const uint8_t * buf, size_t len, const i2p::util::Mapping * options);
 			void HandleRecvFromI2PRaw (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 			void TryResolving ();
-			std::shared_ptr<i2p::datagram::DatagramSession> GetDatagramSession () override;
-			i2p::datagram::DatagramDestination * GetDatagramDestination () const override 
-			{ return m_LocalDest ? m_LocalDest->GetDatagramDestination () : nullptr; }
-			
+
 		private:
 
 			const std::string m_Name;
@@ -203,7 +202,6 @@ namespace client
 			const std::string m_RemoteDest;
 			std::shared_ptr<i2p::client::ClientDestination> m_LocalDest;
 			const boost::asio::ip::udp::endpoint m_LocalEndpoint;
-			std::shared_ptr<const Address> m_RemoteAddr;
 			std::thread * m_ResolveThread;
 			std::unique_ptr<boost::asio::ip::udp::socket> m_LocalSocket;
 			boost::asio::ip::udp::endpoint m_RecvEndpoint;
@@ -213,9 +211,7 @@ namespace client
 			bool m_Gzip;
 			i2p::datagram::DatagramVersion m_DatagramVersion;
 			std::shared_ptr<UDPConvo> m_LastSession;
-			std::weak_ptr<i2p::datagram::DatagramSession> m_LastDatagramSession;
-			uint64_t m_LastRepliableDatagramTime; // millseconds
-			
+
 		public:
 
 			bool isUpdated; // transient, used during reload only

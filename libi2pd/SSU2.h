@@ -139,6 +139,9 @@ namespace transport
 			i2p::util::MemoryPool<SSU2IncompleteMessage>& GetIncompleteMessagesPool () { return m_IncompleteMessagesPool; };
 			i2p::util::MemoryPool<SSU2IncompleteMessage::Fragment>& GetFragmentsPool () { return m_FragmentsPool; };
 
+			void SetVersion (int version);
+            int GetVersion () const { return m_Version; }
+
 		private:
 
 			boost::asio::ip::udp::socket& OpenSocket (const boost::asio::ip::udp::endpoint& localEndpoint);
@@ -198,7 +201,7 @@ namespace transport
 			i2p::util::MemoryPool<SSU2SentPacket> m_SentPacketsPool;
 			i2p::util::MemoryPool<SSU2IncompleteMessage> m_IncompleteMessagesPool;
 			i2p::util::MemoryPool<SSU2IncompleteMessage::Fragment> m_FragmentsPool;
-			boost::asio::deadline_timer m_TerminationTimer, m_CleanupTimer, m_ResendTimer,
+			boost::asio::steady_timer m_TerminationTimer, m_CleanupTimer, m_ResendTimer,
 				m_IntroducersUpdateTimer, m_IntroducersUpdateTimerV6;
 			std::shared_ptr<SSU2Session> m_LastSession;
 			bool m_IsPublished; // if we maintain introducers
@@ -215,6 +218,7 @@ namespace transport
 			i2p::crypto::AEADChaCha20Poly1305Decryptor m_Decryptor;
 			i2p::crypto::ChaCha20Context m_ChaCha20;
 			bool m_IsForcedFirewalled4, m_IsForcedFirewalled6;
+			int m_Version;
 
 			// proxy
 			bool m_IsThroughProxy;
@@ -222,7 +226,7 @@ namespace transport
 			std::unique_ptr<boost::asio::ip::tcp::endpoint> m_ProxyEndpoint;
 			std::unique_ptr<boost::asio::ip::tcp::socket> m_UDPAssociateSocket;
 			std::unique_ptr<boost::asio::ip::udp::endpoint> m_ProxyRelayEndpoint;
-			std::unique_ptr<boost::asio::deadline_timer> m_ProxyConnectRetryTimer;
+			std::unique_ptr<boost::asio::steady_timer> m_ProxyConnectRetryTimer;
 
 		public:
 

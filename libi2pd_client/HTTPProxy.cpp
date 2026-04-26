@@ -538,6 +538,7 @@ namespace proxy
 		m_send_buf.append(m_recv_buf);
 		/* connect to destination */
 		LogPrint(eLogDebug, "HTTPProxy: Connecting to host ", dest_host, ":", dest_port);
+		GetOwner ()->UpdateLastActivityTime ();
 		GetOwner()->CreateStream (std::bind (&HTTPReqHandler::HandleStreamRequestComplete,
 			shared_from_this(), std::placeholders::_1), dest_host, dest_port);
 		return true;
@@ -669,13 +670,18 @@ namespace proxy
 	{
 		if(stream)
 		{
-			m_ClientResponse.code = 200;
-			m_ClientResponse.status = "OK";
-			m_send_buf = m_ClientResponse.to_string();
-			m_sock->send(boost::asio::buffer(m_send_buf));
-			auto connection = std::make_shared<i2p::client::I2PTunnelConnection>(GetOwner(), m_sock, stream);
-			GetOwner()->AddHandler(connection);
-			connection->I2PConnect();
+			if (m_sock && m_sock->is_open ())
+			{
+				m_ClientResponse.code = 200;
+				m_ClientResponse.status = "OK";
+				m_send_buf = m_ClientResponse.to_string();
+				m_sock->send(boost::asio::buffer(m_send_buf));
+				auto connection = std::make_shared<i2p::client::I2PTunnelConnection>(GetOwner(), m_sock, stream);
+				GetOwner()->AddHandler(connection);
+				connection->I2PConnect();
+			}
+			else
+				stream->AsyncClose ();
 			m_sock = nullptr;
 			Terminate();
 		}

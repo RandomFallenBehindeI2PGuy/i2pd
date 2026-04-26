@@ -7,6 +7,7 @@
 */
 
 #include <string.h>
+#include <random>
 #include <fstream>
 #include <sstream>
 #include <boost/asio.hpp>
@@ -113,19 +114,30 @@ namespace data
 			return 0;
 		}
 
-		int reseedRetries = 0;
-		while (reseedRetries < 10)
+		int numReseeds = httpsReseedHostList.size () + yggReseedHostList.size ();
+		int reseedAttempts = std::min (numReseeds, MAX_NUM_RESEED_ATTEMPTS);
+		if (reseedAttempts)
 		{
-			auto ind = rand () % (httpsReseedHostList.size () + yggReseedHostList.size ());
-			bool isHttps = ind < httpsReseedHostList.size ();
-			std::string reseedUrl = isHttps ? httpsReseedHostList[ind] :
-				yggReseedHostList[ind - httpsReseedHostList.size ()];
-			reseedUrl += "i2pseeds.su3";
-			auto num = ReseedFromSU3Url (reseedUrl, isHttps);
-			if (num > 0) return num; // success
-			reseedRetries++;
+			std::mt19937 rng(i2p::util::GetMonotonicMicroseconds () % 1000000LL);
+			for (int i = 0; i < reseedAttempts; i++)
+			{
+				auto ind = rng () % numReseeds;
+				bool isHttps = ind < httpsReseedHostList.size ();
+				std::string reseedUrl = isHttps ? httpsReseedHostList[ind] :
+					yggReseedHostList[ind - httpsReseedHostList.size ()];
+				reseedUrl += "i2pseeds.su3";
+				auto num = ReseedFromSU3Url (reseedUrl, isHttps);
+				if (num > 0) return num; // success
+
+				if (isHttps)
+					httpsReseedHostList.erase (httpsReseedHostList.begin() + ind);
+				else
+					yggReseedHostList.erase (yggReseedHostList.begin() + (ind - httpsReseedHostList.size ()));
+				numReseeds--;
+				if (!numReseeds) break;
+			}
 		}
-		LogPrint (eLogWarning, "Reseed: Failed to reseed from servers after 10 attempts");
+		LogPrint (eLogWarning, "Reseed: Failed to reseed from ", numReseeds, " servers after ", reseedAttempts, " attempts");
 		return 0;
 	}
 
@@ -380,8 +392,8 @@ namespace data
 						uncompressedSize -= inflator.avail_out;
 						if (crc32 (0, uncompressed, uncompressedSize) == crc_32)
 						{
-							i2p::data::netdb.AddRouterInfo (uncompressed, uncompressedSize);
-							numFiles++;
+							if (i2p::data::netdb.AddRouterInfo (uncompressed, uncompressedSize))
+								numFiles++;
 						}
 						else
 							LogPrint (eLogError, "Reseed: CRC32 verification failed");
@@ -393,8 +405,8 @@ namespace data
 				}
 				else // no compression
 				{
-					i2p::data::netdb.AddRouterInfo (compressed, compressedSize);
-					numFiles++;
+					if (i2p::data::netdb.AddRouterInfo (compressed, compressedSize))
+						numFiles++;
 				}
 				delete[] compressed;
 				if (bitFlag & ZIP_BIT_FLAG_DATA_DESCRIPTOR)
@@ -674,10 +686,17 @@ namespace data
 					}
 					if (supported)
 					{
-						s.lowest_layer().connect (ep, ecode);
+						s.lowest_layer().async_connect (ep,
+							[&ecode](const boost::system::error_code& ec)
+							{
+								ecode = ec;
+							});
+						service.run_for (std::chrono::seconds (RESEED_CONNECT_TIMEOUT));
+						if (!service.stopped()) s.lowest_layer().close ();
+
 						if (!ecode)
 						{
-							LogPrint (eLogDebug, "Reseed: Resolved to ", ep.address ());
+							LogPrint (eLogDebug, "Reseed: Connected to ", ep.address ());
 							connected = true;
 							break;
 						}
@@ -737,7 +756,7 @@ namespace data
 		}
 
 		if ((res.code == 301 || res.code == 302 || res.code == 307) && follow) {
-			LogPrint(eLogDebug, "Reseed: Recieved redirect from ", uri);
+			LogPrint(eLogDebug, "Reseed: Received redirect from ", uri);
 
 			std::string location = res.get_header("Location");
 			if (location.length() == 0) {
@@ -789,13 +808,17 @@ namespace data
 			for (const auto& it: endpoints)
 			{
 				boost::asio::ip::tcp::endpoint ep = it;
-				if (
-					i2p::util::net::IsYggdrasilAddress (ep.address ()) &&
-					i2p::context.SupportsMesh ()
-				)
+				if (i2p::util::net::IsYggdrasilAddress (ep.address ()) && i2p::context.SupportsMesh ())
 				{
 					LogPrint (eLogDebug, "Reseed: Yggdrasil: Resolved to ", ep.address ());
-					s.connect (ep, ecode);
+					s.async_connect (ep,
+						[&ecode](const boost::system::error_code& ec)
+						{
+							ecode = ec;
+						});
+					service.run_for (std::chrono::seconds (2*RESEED_CONNECT_TIMEOUT));
+					if (!service.stopped()) s.close ();
+
 					if (!ecode)
 					{
 						connected = true;

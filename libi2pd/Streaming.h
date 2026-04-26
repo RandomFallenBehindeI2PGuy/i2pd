@@ -52,11 +52,8 @@ namespace stream
 
 	const size_t STREAMING_MTU = 1730;
 	const size_t STREAMING_MTU_RATCHETS = 1812;
-#if OPENSSL_PQ
-	const size_t MAX_PACKET_SIZE = 8192;
-#else
-	const size_t MAX_PACKET_SIZE = 4096;
-#endif
+	const size_t MAX_PACKET_SIZE = 3072;
+
 	const size_t COMPRESSION_THRESHOLD_SIZE = 66;
 	const int MAX_NUM_RESEND_ATTEMPTS = 10;
 	const int INITIAL_WINDOW_SIZE = 10;
@@ -78,8 +75,9 @@ namespace stream
 	const uint16_t DELAY_CHOKING = 60000; // in milliseconds
 	const uint16_t DELAY_CHOKING_JAVA = 61000; // in milliseconds
 	const uint16_t DELAY_CHOKING_2 = 65535; // in milliseconds
-	const uint64_t SEND_INTERVAL = 10000; // in microseconds
-	const uint64_t SEND_INTERVAL_VARIANCE = 2000; // in microseconds
+	const uint16_t DELAY_CHOKING_3 = 65534; // in milliseconds
+	const uint64_t SEND_INTERVAL = 5000; // in microseconds
+	const uint64_t SEND_INTERVAL_VARIANCE = 1000; // in microseconds
 	const uint64_t REQUEST_IMMEDIATE_ACK_INTERVAL = 7500; // in milliseconds
 	const uint64_t REQUEST_IMMEDIATE_ACK_INTERVAL_VARIANCE = 3200; // in milliseconds
 	const bool LOSS_BASED_CONTROL_ENABLED = 0; // 0/1
@@ -274,7 +272,7 @@ namespace stream
 			int32_t m_LastConfirmedReceivedSequenceNumber; // for limit inbound speed
 			StreamStatus m_Status;
 			bool m_IsIncoming, m_IsAckSendScheduled, m_IsNAcked, m_IsFirstACK, m_IsResendNeeded,
-				m_IsFirstRttSample, m_IsSendTime, m_IsWinDropped, m_IsChoking2, m_IsClientChoked,
+				m_IsFirstRttSample, m_IsSendTime, m_IsWinDropped, m_IsChoking2, m_IsChoking3, m_IsClientChoked,
 				m_IsClientChoked2, m_IsTimeOutResend, m_IsImmediateAckRequested,
 				m_IsRemoteLeaseChangeInProgress, m_IsBufferEmpty, m_IsJavaClient, m_DontSign;
 			StreamingDestination& m_LocalDestination;
@@ -289,7 +287,7 @@ namespace stream
 			std::set<Packet *, PacketCmp> m_SavedPackets;
 			std::set<Packet *, PacketCmp> m_SentPackets;
 			std::set<Packet *, PacketCmp> m_NACKedPackets;
-			boost::asio::deadline_timer m_ReceiveTimer, m_SendTimer, m_ResendTimer, m_AckSendTimer;
+			boost::asio::steady_timer m_ReceiveTimer, m_SendTimer, m_ResendTimer, m_AckSendTimer;
 			size_t m_NumSentBytes, m_NumReceivedBytes;
 			uint16_t m_Port;
 
@@ -368,7 +366,7 @@ namespace stream
 			Acceptor m_Acceptor;
 			PongHandler m_PongHandler;
 			std::list<std::shared_ptr<Stream> > m_PendingIncomingStreams;
-			boost::asio::deadline_timer m_PendingIncomingTimer;
+			boost::asio::steady_timer m_PendingIncomingTimer;
 			std::unordered_map<uint32_t, std::list<Packet *> > m_SavedPackets; // receiveStreamID->packets, arrived before SYN
 
 			uint64_t m_LastCleanupTime; // in seconds
@@ -396,7 +394,7 @@ namespace stream
 			else
 			{
 				int t = (timeout > MAX_RECEIVE_TIMEOUT) ? MAX_RECEIVE_TIMEOUT : timeout;
-				s->m_ReceiveTimer.expires_from_now (boost::posix_time::seconds(t));
+				s->m_ReceiveTimer.expires_after (std::chrono::seconds(t));
 				int left = timeout - t;
 				s->m_ReceiveTimer.async_wait (
 					[s, buffer, handler, left](const boost::system::error_code & ec)

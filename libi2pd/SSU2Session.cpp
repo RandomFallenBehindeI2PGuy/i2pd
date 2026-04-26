@@ -7,6 +7,7 @@
 */
 
 #include <string.h>
+#include <algorithm>
 #include <openssl/rand.h>
 #include "Log.h"
 #include "Transports.h"
@@ -80,7 +81,7 @@ namespace transport
 	}
 
 	SSU2Session::SSU2Session (SSU2Server& server, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter,
-		std::shared_ptr<const i2p::data::RouterInfo::Address> addr, bool noise):
+		std::shared_ptr<const i2p::data::RouterInfo::Address> addr):
 		TransportSession (in_RemoteRouter, SSU2_CONNECT_TIMEOUT),
 		m_Server (server), m_Address (addr), m_RemoteTransports (0), m_RemotePeerTestTransports (0),
 		m_RemoteVersion (0), m_DestConnID (0), m_SourceConnID (0), m_State (eSSU2SessionStateUnknown),
@@ -91,16 +92,13 @@ namespace transport
 		m_WindowSize (SSU2_MIN_WINDOW_SIZE),
 		m_RTO (SSU2_INITIAL_RTO), m_RelayTag (0),m_ConnectTimer (server.GetService ()),
 		m_TerminationReason (eSSU2TerminationReasonNormalClose),
-		m_MaxPayloadSize (SSU2_MIN_PACKET_SIZE - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - 32), // min size
-		m_LastResendTime (0), m_LastResendAttemptTime (0), m_NumRanges (0)
+		m_MaxPayloadSize (SSU2_MAX_PACKET_SIZE - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - 32), // max size
+		m_LastResendTime (0), m_LastResendAttemptTime (0), m_NextRouterInfoResendTime(0),
+		m_NumRanges (0)
 	{
-		if (noise)
-			m_NoiseState.reset (new i2p::crypto::NoiseSymmetricState);
 		if (in_RemoteRouter && m_Address)
 		{
 			// outgoing
-			if (noise)
-				InitNoiseXKState1 (*m_NoiseState, m_Address->s);
 			m_RemoteEndpoint = boost::asio::ip::udp::endpoint (m_Address->host, m_Address->port);
 			m_RemoteTransports = in_RemoteRouter->GetCompatibleTransports (false);
 			m_RemoteVersion = in_RemoteRouter->GetVersion ();
@@ -108,12 +106,7 @@ namespace transport
 			if (in_RemoteRouter->IsSSU2PeerTesting (false)) m_RemotePeerTestTransports |= i2p::data::RouterInfo::eSSU2V6;
 			RAND_bytes ((uint8_t *)&m_DestConnID, 8);
 			RAND_bytes ((uint8_t *)&m_SourceConnID, 8);
-		}
-		else
-		{
-			// incoming
-			if (noise)
-				InitNoiseXKState1 (*m_NoiseState, i2p::context.GetSSU2StaticPublicKey ());
+			AdjustMaxPayloadSize ();
 		}
 	}
 
@@ -130,7 +123,10 @@ namespace transport
 			ScheduleConnectTimer ();
 			auto token = m_Server.FindOutgoingToken (m_RemoteEndpoint);
 			if (token)
-				SendSessionRequest (token);
+			{
+				if (!SendSessionRequest (token))
+					Terminate ();
+			}
 			else
 			{
 				m_State = eSSU2SessionStateUnknown;
@@ -142,7 +138,7 @@ namespace transport
 	void SSU2Session::ScheduleConnectTimer ()
 	{
 		m_ConnectTimer.cancel ();
-		m_ConnectTimer.expires_from_now (boost::posix_time::seconds(SSU2_CONNECT_TIMEOUT));
+		m_ConnectTimer.expires_after (std::chrono::seconds(SSU2_CONNECT_TIMEOUT));
 		m_ConnectTimer.async_wait (std::bind (&SSU2Session::HandleConnectTimer,
 			shared_from_this (), std::placeholders::_1));
 	}
@@ -184,7 +180,7 @@ namespace transport
 		htobe32buf (payload + 4, nonce);
 		htobe32buf (payload + 8, relayTag);
 		htobe32buf (payload + 12, ts/1000);
-		payload[16] = 2; // ver
+		payload[16] = m_Version; // ver
 		size_t asz = CreateEndpoint (payload + 18, m_MaxPayloadSize - 18, boost::asio::ip::udp::endpoint (localAddress->host, localAddress->port));
 		if (!asz) return false;
 		payload[17] = asz;
@@ -282,9 +278,9 @@ namespace transport
 
 	void SSU2Session::Terminate ()
 	{
-		if (m_State != eSSU2SessionStateTerminated)
+		auto state = m_State.exchange (eSSU2SessionStateTerminated);
+		if (state != eSSU2SessionStateTerminated)
 		{
-			m_State = eSSU2SessionStateTerminated;
 			m_ConnectTimer.cancel ();
 			m_OnEstablished = nullptr;
 			if (m_RelayTag)
@@ -293,6 +289,9 @@ namespace transport
 			m_SentHandshakePacket.reset (nullptr);
 			m_SessionConfirmedFragment.reset (nullptr);
 			m_PathChallenge.reset (nullptr);
+#if OPENSSL_PQ
+			m_PQKeys.reset (nullptr);
+#endif
 			if (!m_IntermediateQueue.empty ())
 				m_SendQueue.splice (m_SendQueue.end (), m_IntermediateQueue);
 			for (auto& it: m_SendQueue)
@@ -333,8 +332,13 @@ namespace transport
 		m_NoiseState.reset (nullptr);
 		m_SessionConfirmedFragment.reset (nullptr);
 		m_SentHandshakePacket.reset (nullptr);
+#if OPENSSL_PQ
+		m_PQKeys.reset (nullptr);
+#endif
 		m_ConnectTimer.cancel ();
 		SetTerminationTimeout (SSU2_TERMINATION_TIMEOUT);
+		m_NextRouterInfoResendTime = i2p::util::GetMillisecondsSinceEpoch () +
+			SSU2_ROUTERINFO_RESEND_INTERVAL + m_Server.GetRng ()() % SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE;
 		SendQueue ();
 		transports.PeerConnected (shared_from_this ());
 
@@ -606,6 +610,12 @@ namespace transport
 			m_SentHandshakePacket->sendTime = ts;
 			return 0;
 		}
+		// schedule resend local RouterInfo
+		if (m_NextRouterInfoResendTime && ts > m_NextRouterInfoResendTime)
+		{
+			SendLocalRouterInfo (true);
+			m_NextRouterInfoResendTime = ts + SSU2_ROUTERINFO_RESEND_INTERVAL + m_Server.GetRng ()() % SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE;
+		}
 		// resend data packets
 		if (m_SentPackets.empty ()) return 0;
 		std::map<uint32_t, std::shared_ptr<SSU2SentPacket> > resentPackets;
@@ -668,10 +678,10 @@ namespace transport
 		switch (header.h.type)
 		{
 			case eSSU2SessionRequest:
-				ProcessSessionRequest (header, buf, len);
+				return ProcessSessionRequest (header, buf, len);
 			break;
 			case eSSU2TokenRequest:
-				ProcessTokenRequest (header, buf, len);
+				return ProcessTokenRequest (header, buf, len);
 			break;
 			case eSSU2PeerTest:
 			{
@@ -699,9 +709,13 @@ namespace transport
 		return true;
 	}
 
-	void SSU2Session::SendSessionRequest (uint64_t token)
+	bool SSU2Session::SendSessionRequest (uint64_t token)
 	{
 		// we are Alice
+#if OPENSSL_PQ
+		if (m_Server.GetVersion () > 2) // we support post quantum in config
+			SetVersion (m_Address->v);
+#endif
 		m_EphemeralKeys = i2p::transport::transports.GetNextX25519KeysPair ();
 		m_SentHandshakePacket.reset (new HandshakePacket);
 		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
@@ -714,17 +728,28 @@ namespace transport
 		header.h.connID = m_DestConnID; // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2SessionRequest;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = m_Version; // ver
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (headerX, &m_SourceConnID, 8); // source id
 		memcpy (headerX + 8, &token, 8); // token
 		memcpy (headerX + 16, m_EphemeralKeys->GetPublicKey (), 32); // X
 		// payload
-		payload[0] = eSSU2BlkDateTime;
-		htobe16buf (payload + 1, 4);
-		htobe32buf (payload + 3, (ts + 500)/1000);
-		size_t payloadSize = 7;
+		size_t payloadSize = 0, offset = 0;
+#if OPENSSL_PQ
+		if (m_Version > 2)
+		{
+			i2p::data::CryptoKeyType cryptoType = (i2p::data::CryptoKeyType)(m_Version + 2);
+			m_PQKeys = i2p::crypto::CreateMLKEMKeys (cryptoType);
+            m_PQKeys->GenerateKeys ();
+            offset = m_PQKeys->GetKeyLen () + 16;
+			payloadSize += offset;
+		}
+#endif
+		payload[payloadSize] = eSSU2BlkDateTime;
+		htobe16buf (payload + payloadSize + 1, 4);
+		htobe32buf (payload + payloadSize + 3, (ts + 500)/1000);
+		payloadSize += 7;
 		if (GetRouterStatus () == eRouterStatusFirewalled && m_Address->IsIntroducer ())
 		{
 			if (!m_Server.IsMaxNumIntroducers (m_RemoteEndpoint.address ().is_v4 ()) ||
@@ -736,21 +761,56 @@ namespace transport
 				payloadSize += 3;
 			}
 		}
-		payloadSize += CreatePaddingBlock (payload + payloadSize, 40 - payloadSize, 1);
+		if (payloadSize <= m_MaxPayloadSize - 48)
+			payloadSize += CreatePaddingBlock (payload + payloadSize, std::min (m_MaxPayloadSize - payloadSize - 48, (size_t)32));
+		else
+		{
+			LogPrint (eLogError, "SSU2: SessionRequest max payload size is too small ", m_MaxPayloadSize);
+			return false;
+		}
+		// create and init noise state
+		if (!m_NoiseState) m_NoiseState.reset (new i2p::crypto::NoiseSymmetricState);
+#if OPENSSL_PQ
+		if (m_Version > 2)
+		{
+			InitNoiseXKStateMLKEM1 (*m_NoiseState, (i2p::data::CryptoKeyType)(m_Version + 2), m_Address->s);
+			m_NoiseState->MixHash (GetRemoteIdentity ()->GetIdentHash (), 32); // h = SHA256(h || bhash)
+		}
+		else
+#endif
+			InitNoiseXKState1 (*m_NoiseState, m_Address->s);
 		// KDF for session request
 		m_NoiseState->MixHash ({ {header.buf, 16}, {headerX, 16} }); // h = SHA256(h || header)
-		m_NoiseState->MixHash (m_EphemeralKeys->GetPublicKey (), 32); // h = SHA256(h || aepk);
+		m_NoiseState->MixHash (m_EphemeralKeys->GetPublicKey (), 32); // h = SHA256(h || aepk)
 		uint8_t sharedSecret[32];
 		m_EphemeralKeys->Agree (m_Address->s, sharedSecret);
 		m_NoiseState->MixKey (sharedSecret);
 		// encrypt
-		const uint8_t nonce[12] = {0}; // always 0
-		i2p::crypto::AEADChaCha20Poly1305 (payload, payloadSize, m_NoiseState->m_H, 32, m_NoiseState->m_CK + 32, nonce, payload, payloadSize + 16, true);
+#if OPENSSL_PQ
+		if (m_PQKeys)
+		{
+			size_t keyLen = m_PQKeys->GetKeyLen ();
+			std::vector<uint8_t> encapsKey(keyLen);
+			m_PQKeys->GetPublicKey (encapsKey.data ());
+			if (!m_NoiseState->Encrypt (encapsKey.data (), payload, keyLen))
+			{
+				LogPrint (eLogWarning, "SSU2: SessionRequest ML-KEM encap_key frame AEAD encryption failed ");
+				return false;
+			}
+			m_NoiseState->MixHash (payload, keyLen + 16); // h = SHA256(h || ciphertext)
+		}
+#endif
+		if (!m_NoiseState->Encrypt (payload + offset, payload + offset, payloadSize - offset))
+		{
+			LogPrint (eLogWarning, "SSU2: SessionRequest payload encryption failed ");
+			return false;
+		}
 		payloadSize += 16;
 		header.ll[0] ^= CreateHeaderMask (m_Address->i, payload + (payloadSize - 24));
 		header.ll[1] ^= CreateHeaderMask (m_Address->i, payload + (payloadSize - 12));
+		const uint8_t nonce[12] = {0}; // always 0
 		m_Server.ChaCha20 (headerX, 48, m_Address->i, nonce, headerX);
-		m_NoiseState->MixHash (payload, payloadSize); // h = SHA256(h || encrypted payload from Session Request) for SessionCreated
+		m_NoiseState->MixHash (payload + offset, payloadSize - offset); // h = SHA256(h || encrypted payload from Session Request) for SessionCreated
 		m_SentHandshakePacket->payloadSize = payloadSize;
 		// send
 		if (m_State == eSSU2SessionStateTokenReceived || m_Server.AddPendingOutgoingSession (shared_from_this ()))
@@ -762,22 +822,51 @@ namespace transport
 		else
 		{
 			LogPrint (eLogWarning, "SSU2: SessionRequest request to ", m_RemoteEndpoint, " already pending");
-			Terminate ();
+			return false;
 		}
+		return true;
 	}
 
-	void SSU2Session::ProcessSessionRequest (Header& header, uint8_t * buf, size_t len)
+	bool SSU2Session::ProcessSessionRequest (Header& header, uint8_t * buf, size_t len)
 	{
 		// we are Bob
-		if (len < 88)
+		if (len < 90)
 		{
 			LogPrint (eLogWarning, "SSU2: SessionRequest message too short ", len);
-			return;
+			return false;
 		}
-		if (header.h.flags[0] != 2) // ver
+#if OPENSSL_PQ
+		if (header.h.flags[0] >= 2 && header.h.flags[0] <= 4) // ver
 		{
-            LogPrint (eLogInfo, "SSU2: SessionRequest protocol version ", header.h.flags[0], " is not supported");
-            return;
+			if (m_Server.GetVersion () > 2)
+			{
+				if (SetVersion (header.h.flags[0]))
+				{
+					if (m_Version > 2)
+					{
+						auto keyLen = i2p::crypto::GetMLKEMPublicKeyLen ((i2p::data::CryptoKeyType)(m_Version + 2));
+						if (len < keyLen + 16 + 90)
+						{
+							LogPrint (eLogWarning, "SSU2: SessionRequest version ", m_Version, " message too short ", len);
+							return false;
+						}
+					}
+				}
+				else
+				{
+					m_TerminationReason = eSSU2TerminationReasonIncompatibleVersion;
+					SendRetry ();
+					return true;
+				}
+			}
+		}
+		else
+#else
+		if (header.h.flags[0] != 2) // ver
+#endif
+		{
+            LogPrint (eLogWarning, "SSU2: SessionRequest protocol version ", (int)header.h.flags[0], " is not supported");
+            return false;
 		}
 		const uint8_t nonce[12] = {0};
 		uint8_t headerX[48];
@@ -789,8 +878,19 @@ namespace transport
 		{
 			LogPrint (eLogDebug, "SSU2: SessionRequest token mismatch. Retry");
 			SendRetry ();
-			return;
+			return true;
 		}
+		// create and init noise state
+		if (!m_NoiseState) m_NoiseState.reset (new i2p::crypto::NoiseSymmetricState);
+#if OPENSSL_PQ
+		if (m_Version > 2)
+		{
+			InitNoiseXKStateMLKEM1 (*m_NoiseState, (i2p::data::CryptoKeyType)(m_Version + 2), i2p::context.GetSSU2StaticPublicKey ());
+			m_NoiseState->MixHash (i2p::context.GetIdentHash (), 32); // h = SHA256(h || bhash)
+		}
+		else
+#endif
+			InitNoiseXKState1 (*m_NoiseState, i2p::context.GetSSU2StaticPublicKey ());
 		// KDF for session request
 		m_NoiseState->MixHash ( { {header.buf, 16}, {headerX, 16} } ); // h = SHA256(h || header)
 		m_NoiseState->MixHash (headerX + 16, 32); // h = SHA256(h || aepk);
@@ -798,15 +898,37 @@ namespace transport
 		i2p::context.GetSSU2StaticKeys ().Agree (headerX + 16, sharedSecret);
 		m_NoiseState->MixKey (sharedSecret);
 		// decrypt
-		uint8_t * payload = buf + 64;
-		std::vector<uint8_t> decryptedPayload(len - 80);
-		if (!i2p::crypto::AEADChaCha20Poly1305 (payload, len - 80, m_NoiseState->m_H, 32,
-			m_NoiseState->m_CK + 32, nonce, decryptedPayload.data (), decryptedPayload.size (), false))
+		size_t offset = 64;
+#if OPENSSL_PQ
+        if (m_Version > 2)
+        {
+			auto cryptoType = (i2p::data::CryptoKeyType)(m_Version + 2);
+            auto keyLen = i2p::crypto::GetMLKEMPublicKeyLen (cryptoType);
+            std::vector<uint8_t> encapsKey(keyLen);
+            if (!m_NoiseState->Decrypt (buf + offset, encapsKey.data (), keyLen))
+            {
+				LogPrint (eLogWarning, "SSU2: SessionRequest ML-KEM ciphertext section AEAD decryption failed");
+				return false;
+            }
+			m_NoiseState->MixHash (buf + offset, keyLen + 16);
+			offset += keyLen + 16;
+			m_PQKeys = i2p::crypto::CreateMLKEMKeys (cryptoType);
+			m_PQKeys->SetPublicKey (encapsKey.data ());
+        }
+#endif
+		if (offset + 16 > len)
+		{
+			LogPrint (eLogWarning, "SSU2: SessionRequest message is too short ", len);
+			return false;
+		}
+		uint8_t * payload = buf + offset;
+		std::vector<uint8_t> decryptedPayload(len - offset - 16);
+		if (!m_NoiseState->Decrypt (payload, decryptedPayload.data (), decryptedPayload.size ()))
 		{
 			LogPrint (eLogWarning, "SSU2: SessionRequest AEAD verification failed ");
-			return;
+			return false;
 		}
-		m_NoiseState->MixHash (payload, len - 64); // h = SHA256(h || encrypted payload from Session Request) for SessionCreated
+		m_NoiseState->MixHash (payload, len - offset); // h = SHA256(h || encrypted payload from Session Request) for SessionCreated
 		// payload
 		m_State = eSSU2SessionStateSessionRequestReceived;
 		HandlePayload (decryptedPayload.data (), decryptedPayload.size ());
@@ -818,6 +940,7 @@ namespace transport
 		}
 		else
 			SendRetry ();
+		return true;
 	}
 
 	void SSU2Session::SendSessionCreated (const uint8_t * X)
@@ -837,18 +960,42 @@ namespace transport
 		header.h.connID = m_DestConnID; // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2SessionCreated;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = m_Version; // ver
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (headerX, &m_SourceConnID, 8); // source id
 		memset (headerX + 8, 0, 8); // token = 0
 		memcpy (headerX + 16, m_EphemeralKeys->GetPublicKey (), 32); // Y
+		// KDF for SessionCreated
+		m_NoiseState->MixHash ( { {header.buf, 16}, {headerX, 16} } ); // h = SHA256(h || header)
+		m_NoiseState->MixHash (headerX + 16, 32); // h = SHA256(h || bepk);
+		uint8_t sharedSecret[32];
+		m_EphemeralKeys->Agree (X, sharedSecret);
+		m_NoiseState->MixKey (sharedSecret);
 		// payload
 		size_t maxPayloadSize = m_MaxPayloadSize - 48;
-		payload[0] = eSSU2BlkDateTime;
-		htobe16buf (payload + 1, 4);
-		htobe32buf (payload + 3, (ts + 500)/1000);
-		size_t payloadSize = 7;
+		size_t payloadSize = 0, offset = 0;
+#if OPENSSL_PQ
+        if (m_Version > 2 && m_PQKeys)
+        {
+            size_t cipherTextLen = m_PQKeys->GetCTLen ();
+			std::vector<uint8_t> kemCiphertext(cipherTextLen);
+			m_PQKeys->Encaps (kemCiphertext.data (), sharedSecret);
+			if (!m_NoiseState->Encrypt (kemCiphertext.data (), payload, cipherTextLen))
+			{
+				LogPrint (eLogWarning, "SSU2: SessionCreated ML-KEM ciphertext section AEAD encryption failed");
+				return;
+			}
+			offset = cipherTextLen + 16;
+			m_NoiseState->MixHash (payload, offset); // encrypt ML-KEM frame
+			m_NoiseState->MixKey (sharedSecret);
+            payloadSize += offset;
+        }
+#endif
+		payload[payloadSize] = eSSU2BlkDateTime;
+		htobe16buf (payload + payloadSize + 1, 4);
+		htobe32buf (payload + payloadSize + 3, (ts + 500)/1000);
+		payloadSize += 7;
 		payloadSize += CreateAddressBlock (payload + payloadSize, maxPayloadSize - payloadSize, m_RemoteEndpoint);
 		if (m_RelayTag)
 		{
@@ -866,18 +1013,22 @@ namespace transport
 			memcpy (payload + payloadSize + 7, &token.first, 8); // token
 			payloadSize += 15;
 		}
-		payloadSize += CreatePaddingBlock (payload + payloadSize, maxPayloadSize - payloadSize);
-		// KDF for SessionCreated
-		m_NoiseState->MixHash ( { {header.buf, 16}, {headerX, 16} } ); // h = SHA256(h || header)
-		m_NoiseState->MixHash (headerX + 16, 32); // h = SHA256(h || bepk);
-		uint8_t sharedSecret[32];
-		m_EphemeralKeys->Agree (X, sharedSecret);
-		m_NoiseState->MixKey (sharedSecret);
+		if (payloadSize <= maxPayloadSize)
+			payloadSize += CreatePaddingBlock (payload + payloadSize, std::min (maxPayloadSize - payloadSize, (size_t)64));
+		else
+		{
+			LogPrint (eLogError, "SSU2: SessionCreated max payload size is too small ", maxPayloadSize);
+			return;
+		}
 		// encrypt
 		const uint8_t nonce[12] = {0}; // always zero
-		i2p::crypto::AEADChaCha20Poly1305 (payload, payloadSize, m_NoiseState->m_H, 32, m_NoiseState->m_CK + 32, nonce, payload, payloadSize + 16, true);
+		if (!m_NoiseState->Encrypt (payload + offset, payload + offset, payloadSize - offset))
+		{
+			LogPrint (eLogWarning, "SSU2: SessionCreated payload encryption failed ");
+			return;
+		}
 		payloadSize += 16;
-		m_NoiseState->MixHash (payload, payloadSize); // h = SHA256(h || encrypted Noise payload from Session Created)
+		m_NoiseState->MixHash (payload + offset, payloadSize - offset); // h = SHA256(h || encrypted Noise payload from Session Created)
 		header.ll[0] ^= CreateHeaderMask (i2p::context.GetSSU2IntroKey (), payload + (payloadSize - 24));
 		header.ll[1] ^= CreateHeaderMask (kh2, payload + (payloadSize - 12));
 		m_Server.ChaCha20 (headerX, 48, kh2, nonce, headerX);
@@ -891,6 +1042,11 @@ namespace transport
 	bool SSU2Session::ProcessSessionCreated (uint8_t * buf, size_t len)
 	{
 		// we are Alice
+		if (!m_NoiseState)
+		{
+			LogPrint (eLogWarning, "SSU2: Unexpected SessionCreated message");
+			return false;
+		}
 		Header header;
 		memcpy (header.buf, buf, 16);
 		header.ll[0] ^= CreateHeaderMask (m_Address->i, buf + (len - 24));
@@ -915,24 +1071,45 @@ namespace transport
 		uint8_t sharedSecret[32];
 		m_EphemeralKeys->Agree (headerX + 16, sharedSecret);
 		m_NoiseState->MixKey (sharedSecret);
-		// decrypt
-		uint8_t * payload = buf + 64;
-		std::vector<uint8_t> decryptedPayload(len - 80);
-		if (!i2p::crypto::AEADChaCha20Poly1305 (payload, len - 80, m_NoiseState->m_H, 32,
-			m_NoiseState->m_CK + 32, nonce, decryptedPayload.data (), decryptedPayload.size (), false))
+		size_t offset = 64;
+#if OPENSSL_PQ
+		if (m_Version > 2 && m_PQKeys)
 		{
-			LogPrint (eLogWarning, "SSU2: SessionCreated AEAD verification failed ");
+			i2p::data::CryptoKeyType cryptoType = (i2p::data::CryptoKeyType)(m_Version + 2);
+			size_t cipherTextLen = i2p::crypto::GetMLKEMCipherTextLen (cryptoType);
+			std::vector<uint8_t> kemCiphertext(cipherTextLen);
+			if (!m_NoiseState->Decrypt (buf + offset, kemCiphertext.data (), cipherTextLen))
+			{
+				LogPrint (eLogWarning, "SSU2: SessionCreated ML-KEM ciphertext section AEAD decryption failed");
+				return false;
+			}
+			m_NoiseState->MixHash (buf + offset, cipherTextLen + 16);
+			offset += cipherTextLen + 16;
+			m_PQKeys->Decaps (kemCiphertext.data (), sharedSecret);
+			m_NoiseState->MixKey (sharedSecret);
+		}
+#endif
+		// decrypt
+		if (offset + 16 > len)
+		{
+			LogPrint (eLogWarning, "SSU2: SessionCreated message is too short ", len);
+			return false;
+		}
+		uint8_t * payload = buf + offset;
+		std::vector<uint8_t> decryptedPayload(len - offset - 16);
+		if (!m_NoiseState->Decrypt (payload, decryptedPayload.data (), decryptedPayload.size ()))
+		{
+			LogPrint (eLogWarning, "SSU2: SessionCreated AEAD verification failed");
 			if (GetRemoteIdentity ())
 				i2p::data::netdb.SetUnreachable (GetRemoteIdentity ()->GetIdentHash (), true);  // assume wrong s key
 			return false;
 		}
-		m_NoiseState->MixHash (payload, len - 64); // h = SHA256(h || encrypted payload from SessionCreated) for SessionConfirmed
+		m_NoiseState->MixHash (payload, len - offset); // h = SHA256(h || encrypted payload from SessionCreated) for SessionConfirmed
 		// payload
 		m_State = eSSU2SessionStateSessionCreatedReceived;
 		HandlePayload (decryptedPayload.data (), decryptedPayload.size ());
 
 		m_Server.AddSession (shared_from_this ());
-		AdjustMaxPayloadSize ();
 		SendSessionConfirmed (headerX + 16);
 		KDFDataPhase (m_KeyDataSend, m_KeyDataReceive);
 
@@ -972,17 +1149,14 @@ namespace transport
 		m_NoiseState->MixHash (header.buf, 16); // h = SHA256(h || header)
 		// Encrypt part 1
 		uint8_t * part1 = m_SentHandshakePacket->headerX;
-		uint8_t nonce[12];
-		CreateNonce (1, nonce); // always one
-		i2p::crypto::AEADChaCha20Poly1305 (i2p::context.GetSSU2StaticPublicKey (), 32, m_NoiseState->m_H, 32, m_NoiseState->m_CK + 32, nonce, part1, 48, true);
+		m_NoiseState->Encrypt (i2p::context.GetSSU2StaticPublicKey (), part1, 32);
 		m_NoiseState->MixHash (part1, 48); // h = SHA256(h || ciphertext);
 		// KDF for Session Confirmed part 2
 		uint8_t sharedSecret[32];
 		i2p::context.GetSSU2StaticKeys ().Agree (Y, sharedSecret);
 		m_NoiseState->MixKey (sharedSecret);
 		// Encrypt part2
-		memset (nonce, 0, 12); // always zero
-		i2p::crypto::AEADChaCha20Poly1305 (payload, payloadSize, m_NoiseState->m_H, 32, m_NoiseState->m_CK + 32, nonce, payload, payloadSize + 16, true);
+		m_NoiseState->Encrypt (payload, payload, payloadSize);
 		payloadSize += 16;
 		m_NoiseState->MixHash (payload, payloadSize); // h = SHA256(h || ciphertext);
 		m_SentHandshakePacket->payloadSize = payloadSize;
@@ -1026,6 +1200,11 @@ namespace transport
 	bool SSU2Session::ProcessSessionConfirmed (uint8_t * buf, size_t len)
 	{
 		// we are Bob
+		if (!m_NoiseState)
+		{
+			LogPrint (eLogWarning, "SSU2: Unexpected SessionConfirmed message");
+			return false;
+		}
 		Header header;
 		memcpy (header.buf, buf, 16);
 		header.ll[0] ^= CreateHeaderMask (i2p::context.GetSSU2IntroKey (), buf + (len - 24));
@@ -1117,11 +1296,8 @@ namespace transport
 		// KDF for Session Confirmed part 1
 		m_NoiseState->MixHash (header.buf, 16); // h = SHA256(h || header)
 		// decrypt part1
-		uint8_t nonce[12];
-		CreateNonce (1, nonce);
 		uint8_t S[32];
-		if (!i2p::crypto::AEADChaCha20Poly1305 (buf + 16, 32, m_NoiseState->m_H, 32,
-			m_NoiseState->m_CK + 32, nonce, S, 32, false))
+		if (!m_NoiseState->Decrypt (buf + 16, S, 32))
 		{
 			LogPrint (eLogWarning, "SSU2: SessionConfirmed part 1 AEAD verification failed ");
 			if (m_SessionConfirmedFragment) m_SessionConfirmedFragment.reset (nullptr);
@@ -1134,11 +1310,9 @@ namespace transport
 		m_NoiseState->MixKey (sharedSecret);
 		KDFDataPhase (m_KeyDataReceive, m_KeyDataSend);
 		// decrypt part2
-		memset (nonce, 0, 12);
 		uint8_t * payload = buf + 64;
 		std::vector<uint8_t> decryptedPayload(len - 80);
-		if (!i2p::crypto::AEADChaCha20Poly1305 (payload, len - 80, m_NoiseState->m_H, 32,
-			m_NoiseState->m_CK + 32, nonce, decryptedPayload.data (), decryptedPayload.size (), false))
+		if (!m_NoiseState->Decrypt (payload, decryptedPayload.data (), len - 80))
 		{
 			LogPrint (eLogWarning, "SSU2: SessionConfirmed part 2 AEAD verification failed ");
 			if (m_SessionConfirmedFragment) m_SessionConfirmedFragment.reset (nullptr);
@@ -1254,8 +1428,14 @@ namespace transport
 
 		// handle other blocks
 		HandlePayload (decryptedPayload.data () + riSize + 3, decryptedPayload.size () - riSize - 3);
-		Established ();
 
+		Established ();
+		if (ri->GetCongestion () == i2p::data::RouterInfo::eRejectAll)
+		{
+			auto terminationTimeout = GetTerminationTimeout ()/2;
+			if (terminationTimeout < SSU2_CONNECT_TIMEOUT) terminationTimeout = SSU2_CONNECT_TIMEOUT;
+			SetTerminationTimeout (terminationTimeout);
+		}
 		SendQuickAck ();
 
 		return true;
@@ -1274,13 +1454,17 @@ namespace transport
 	void SSU2Session::SendTokenRequest ()
 	{
 		// we are Alice
+#if OPENSSL_PQ
+		if (m_Server.GetVersion () > 2) // we support post quantum in config
+			SetVersion (m_Address->v);
+#endif
 		Header header;
 		uint8_t h[32], payload[41];
 		// fill packet
 		header.h.connID = m_DestConnID; // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2TokenRequest;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = GetVersion (); // ver
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (h, header.buf, 16);
@@ -1311,13 +1495,27 @@ namespace transport
 		}
 	}
 
-	void SSU2Session::ProcessTokenRequest (Header& header, uint8_t * buf, size_t len)
+	bool SSU2Session::ProcessTokenRequest (Header& header, uint8_t * buf, size_t len)
 	{
 		// we are Bob
 		if (len < 48)
 		{
 			LogPrint (eLogWarning, "SSU2: Incorrect TokenRequest len ", len);
-			return;
+			return false;
+		}
+#if OPENSSL_PQ
+		if (header.h.flags[0] >= 2 && header.h.flags[0] <= 4) // ver
+		{
+			if (m_Server.GetVersion () > 2)
+				SetVersion (header.h.flags[0]);
+		}
+		else
+#else
+		if (header.h.flags[0] != 2) // ver
+#endif
+		{
+            LogPrint (eLogWarning, "SSU2: TokenRequest protocol version ", (int)header.h.flags[0], " is not supported");
+            return false;
 		}
 		uint8_t nonce[12] = {0};
 		uint8_t h[32];
@@ -1331,12 +1529,13 @@ namespace transport
 			i2p::context.GetSSU2IntroKey (), nonce, payload, len - 48, false))
 		{
 			LogPrint (eLogWarning, "SSU2: TokenRequest AEAD verification failed ");
-			return;
+			return false;
 		}
 		// payload
 		m_State = eSSU2SessionStateTokenRequestReceived;
 		HandlePayload (payload, len - 48);
 		SendRetry ();
+		return true;
 	}
 
 	void SSU2Session::SendRetry ()
@@ -1348,7 +1547,7 @@ namespace transport
 		header.h.connID = m_DestConnID; // dest id
 		RAND_bytes (header.buf + 8, 4); // random packet num
 		header.h.type = eSSU2Retry;
-		header.h.flags[0] = 2; // ver
+		header.h.flags[0] = GetVersion (); // ver
 		header.h.flags[1] = (uint8_t)i2p::context.GetNetID (); // netID
 		header.h.flags[2] = 0; // flag
 		memcpy (h, header.buf, 16);
@@ -1416,15 +1615,25 @@ namespace transport
 		}
 		m_State = eSSU2SessionStateTokenReceived;
 		HandlePayload (payload, len - 48);
+		if (m_TerminationReason == eSSU2TerminationReasonIncompatibleVersion)
+			m_Version = 2; // fallback to non-PQ
 		if (!token)
 		{
 			// we should handle payload even for zero token to handle Datetime block and adjust clock in case of clock skew
 			LogPrint (eLogWarning, "SSU2: Retry token is zero");
 			return false;
 		}
+
+		if (!m_NoiseState) m_NoiseState.reset (new i2p::crypto::NoiseSymmetricState);
+#if OPENSSL_PQ
+		if (m_Version > 2)
+			InitNoiseXKStateMLKEM1 (*m_NoiseState, (i2p::data::CryptoKeyType)(m_Version + 2), m_Address->s);
+		else
+#endif
 		InitNoiseXKState1 (*m_NoiseState, m_Address->s); // reset Noise TODO: check state
-		SendSessionRequest (token);
-		return true;
+
+		m_TerminationReason = eSSU2TerminationReasonNormalClose;
+		return SendSessionRequest (token);
 	}
 
 	bool SSU2Session::ProcessHolePunch (uint8_t * buf, size_t len)
@@ -1606,6 +1815,8 @@ namespace transport
 								m_State = eSSU2SessionStateClosingConfirmed;
 							Done ();
 						}
+						else
+							m_TerminationReason = (SSU2TerminationReason)rsn;
 					}
 					else
 						LogPrint(eLogWarning, "SSU2: Unexpected termination block size ", size);
@@ -1766,6 +1977,7 @@ namespace transport
 						m_RelayTag = 0; // not longer introducer
 				}
 			}
+			i2p::transport::transports.UpdatePeerParams (newRi);
 		}
 	}
 
@@ -1860,7 +2072,7 @@ namespace transport
 						{
 							i2p::context.SetError (eRouterErrorFullConeNAT); // TODO: Full-Cone NAT detection isn't working.
 							// i2p::context.PublishNTCP2Address (TCP_PORT, true, true, false, false); // TODO: TCP_PORT to be filled similar to ep.port()
-							i2p::context.PublishSSU2Address (ep.port(), true, true, false);
+							i2p::context.PublishSSU2Address (ep.port(), true, true, false, m_Server.GetVersion ());
 						}
 					}
 					else
@@ -1871,7 +2083,7 @@ namespace transport
 						{
 							i2p::context.SetErrorV6 (eRouterErrorFullConeNAT);
 							// i2p::context.PublishNTCP2Address (TCP_PORT, true, false, true, false); // TODO: TCP_PORT to be filled similar to ep.port()
-							i2p::context.PublishSSU2Address (ep.port(), true, false, true);
+							i2p::context.PublishSSU2Address (ep.port(), true, false, true, m_Server.GetVersion ());
 						}
 					}
 				}
@@ -2596,9 +2808,9 @@ namespace transport
 		if (addr && addr->ssu)
 		{
 			int mtu = addr->ssu->mtu;
-			if (!mtu && addr->IsV4 ()) mtu = SSU2_MAX_PACKET_SIZE;
+			if (!mtu) mtu = SSU2_MAX_PACKET_SIZE;
 			if (mtu > (int)maxMtu) mtu = maxMtu;
-			if (m_Address && m_Address->ssu && (!mtu || m_Address->ssu->mtu < mtu))
+			if (m_Address && m_Address->ssu && m_Address->ssu->mtu && (!mtu || m_Address->ssu->mtu < mtu))
 				mtu = m_Address->ssu->mtu;
 			if (mtu)
 			{
@@ -3239,6 +3451,22 @@ namespace transport
 	i2p::data::RouterInfo::SupportedTransports SSU2Session::GetTransportType () const
 	{
 		return m_RemoteEndpoint.address ().is_v4 () ? i2p::data::RouterInfo::eSSU2V4 : i2p::data::RouterInfo::eSSU2V6;
+	}
+
+	bool SSU2Session::SetVersion (uint8_t version)
+	{
+		switch (version)
+		{
+			case 3:
+				m_Version = 3;
+			break;
+			case 4:
+				m_Version = (m_MaxPayloadSize >= SSU2_MLKEM768_MIN_PAYLOAD_SIZE) ? 4: 2;
+			break;
+			default:
+				m_Version = 2;
+		}
+		return m_Version == version;
 	}
 }
 }

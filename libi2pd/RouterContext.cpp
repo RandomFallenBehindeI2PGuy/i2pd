@@ -34,7 +34,10 @@ namespace i2p
 		m_ShareRatio (100), m_Status (eRouterStatusUnknown), m_StatusV6 (eRouterStatusUnknown),
 		m_Error (eRouterErrorNone), m_ErrorV6 (eRouterErrorNone),
 		m_Testing (false), m_TestingV6 (false), m_NetID (I2PD_NET_ID),
-		m_PublishReplyToken (0), m_IsHiddenMode (false), m_IsSaving (false)
+		m_PublishReplyToken (0), m_IsHiddenMode (false)
+#if __cplusplus < 202002L // C++20
+		, m_IsSaving ATOMIC_FLAG_INIT // {0}
+#endif
 	{
 	}
 
@@ -58,11 +61,11 @@ namespace i2p
 		{
 			m_Service.reset (new RouterService);
 			m_Service->Start ();
-			m_PublishTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
+			m_PublishTimer.reset (new boost::asio::steady_timer (m_Service->GetService ()));
 			ScheduleInitialPublish ();
-			m_CongestionUpdateTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
+			m_CongestionUpdateTimer.reset (new boost::asio::steady_timer (m_Service->GetService ()));
 			ScheduleCongestionUpdate ();
-			m_CleanupTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
+			m_CleanupTimer.reset (new boost::asio::steady_timer (m_Service->GetService ()));
 			ScheduleCleanupTimer ();
 		}
 	}
@@ -269,8 +272,8 @@ namespace i2p
 			std::lock_guard<std::mutex> l(m_SaveBufferMutex);
 			m_SaveBuffer = buffer;
 		}
-		bool isSaving = false;
-		if (m_IsSaving.compare_exchange_strong (isSaving, true)) // try to save only if not being saved
+		bool isSaving = m_IsSaving.test_and_set ();
+		if (!isSaving) // try to save only if not being saved
 		{
 			auto savingRouterInfo = std::async (std::launch::async, [this]()
 				{
@@ -285,7 +288,7 @@ namespace i2p
 						if (buffer)
 							i2p::data::RouterInfo::SaveToFile (i2p::fs::DataDirPath (ROUTER_INFO), buffer);
 					}
-					m_IsSaving = false;
+					m_IsSaving.clear ();
 				});
 		}
 		m_LastUpdateTime = i2p::util::GetSecondsSinceEpoch ();
@@ -469,7 +472,7 @@ namespace i2p
 		}
 	}
 
-	void RouterContext::PublishSSU2Address (int port, bool publish, bool v4, bool v6)
+	void RouterContext::PublishSSU2Address (int port, bool publish, bool v4, bool v6, int version)
 	{
 		if (!m_SSU2Keys) return;
 		auto addresses = m_RouterInfo.GetAddresses ();
@@ -488,12 +491,14 @@ namespace i2p
 		bool updated = false;
 		for (auto& address : *addresses)
 		{
-			if (address && address->IsSSU2 () && (!address->port || address->port != port || address->published != publish) &&
+			if (address && address->IsSSU2 () && (!address->port || address->port != port ||
+				address->published != publish || address->v != version) &&
 				((v4 && address->IsV4 ()) || (v6 && address->IsV6 ())))
 			{
 				if (port) address->port = port;
 				else if (!address->port) address->port = newPort;
 				address->published = publish;
+				address->v = version;
 				if (publish)
 				{
                     UpdateSSU2AddressCapsTesting (address, true);
@@ -646,7 +651,7 @@ namespace i2p
                 m_RouterInfo.UpdateFloodfillProperty (true);
                 if (addresses)
                 {
-                    // diable introducer for all floodfill's SSU2 addresses
+                    // disable introducer for all floodfill's SSU2 addresses
                     UpdateSSU2AddressCapsIntroducer ((*addresses)[i2p::data::RouterInfo::eSSU2V4Idx], false);
                     UpdateSSU2AddressCapsIntroducer ((*addresses)[i2p::data::RouterInfo::eSSU2V6Idx], false);
                 }
@@ -1423,7 +1428,7 @@ namespace i2p
 	{
 		if (m_PublishTimer)
 		{
-			m_PublishTimer->expires_from_now (boost::posix_time::seconds(ROUTER_INFO_INITIAL_PUBLISH_INTERVAL));
+			m_PublishTimer->expires_after (std::chrono::seconds(ROUTER_INFO_INITIAL_PUBLISH_INTERVAL));
 			m_PublishTimer->async_wait (std::bind (&RouterContext::HandleInitialPublishTimer,
 				this, std::placeholders::_1));
 		}
@@ -1453,7 +1458,7 @@ namespace i2p
 		if (m_PublishTimer)
 		{
 			m_PublishTimer->cancel ();
-			m_PublishTimer->expires_from_now (boost::posix_time::seconds(ROUTER_INFO_PUBLISH_INTERVAL +
+			m_PublishTimer->expires_after (std::chrono::seconds(ROUTER_INFO_PUBLISH_INTERVAL +
 				GetRng ()() % ROUTER_INFO_PUBLISH_INTERVAL_VARIANCE));
 			m_PublishTimer->async_wait (std::bind (&RouterContext::HandlePublishTimer,
 				this, std::placeholders::_1));
@@ -1544,7 +1549,7 @@ namespace i2p
 		if (m_PublishTimer)
 		{
 			m_PublishTimer->cancel ();
-			m_PublishTimer->expires_from_now (boost::posix_time::milliseconds(ROUTER_INFO_CONFIRMATION_TIMEOUT));
+			m_PublishTimer->expires_after (std::chrono::milliseconds(ROUTER_INFO_CONFIRMATION_TIMEOUT));
 			m_PublishTimer->async_wait (std::bind (&RouterContext::HandlePublishResendTimer,
 				this, std::placeholders::_1));
 		}
@@ -1567,7 +1572,7 @@ namespace i2p
 		if (m_CongestionUpdateTimer)
 		{
 			m_CongestionUpdateTimer->cancel ();
-			m_CongestionUpdateTimer->expires_from_now (boost::posix_time::seconds(
+			m_CongestionUpdateTimer->expires_after (std::chrono::seconds(
 				ROUTER_INFO_CONGESTION_UPDATE_INTERVAL + GetRng ()() % ROUTER_INFO_CONGESTION_UPDATE_INTERVAL_VARIANCE));
 			m_CongestionUpdateTimer->async_wait (std::bind (&RouterContext::HandleCongestionUpdateTimer,
 				this, std::placeholders::_1));
@@ -1607,7 +1612,7 @@ namespace i2p
 		if (m_CleanupTimer)
 		{
 			m_CleanupTimer->cancel ();
-			m_CleanupTimer->expires_from_now (boost::posix_time::seconds(ROUTER_INFO_CLEANUP_INTERVAL));
+			m_CleanupTimer->expires_after (std::chrono::seconds(ROUTER_INFO_CLEANUP_INTERVAL));
 			m_CleanupTimer->async_wait (std::bind (&RouterContext::HandleCleanupTimer,
 				this, std::placeholders::_1));
 		}

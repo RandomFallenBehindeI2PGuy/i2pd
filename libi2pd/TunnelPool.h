@@ -15,6 +15,7 @@
 #include <utility>
 #include <mutex>
 #include <memory>
+#include <random>
 #include "Identity.h"
 #include "LeaseSet.h"
 #include "RouterInfo.h"
@@ -28,6 +29,7 @@ namespace i2p
 namespace tunnel
 {
 	const int TUNNEL_POOL_MANAGE_INTERVAL = 10; // in seconds
+	const int TUNNEL_POOL_TUNNEL_CREATED_RECENTLY_INTERVAL = 120; // in seconds
 	const int TUNNEL_POOL_MAX_INBOUND_TUNNELS_QUANTITY = 16;
 	const int TUNNEL_POOL_MAX_OUTBOUND_TUNNELS_QUANTITY = 16;
 	const int TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS = 3;
@@ -121,9 +123,10 @@ namespace tunnel
 
 		private:
 
-			void TestTunnels ();
-			void CreateInboundTunnel ();
-			void CreateOutboundTunnel ();
+			void TestTunnels (uint64_t ts);
+			void CreateTunnels (uint64_t ts);
+			void CreateInboundTunnel (uint64_t ts);
+			void CreateOutboundTunnel (uint64_t ts);
 			void CreatePairedInboundTunnel (std::shared_ptr<OutboundTunnel> outboundTunnel);
 			template<class TTunnels>
 			typename TTunnels::value_type GetNextTunnel (TTunnels& tunnels,
@@ -149,6 +152,7 @@ namespace tunnel
 			uint64_t m_NextManageTime; // in seconds
 			std::mutex m_CustomPeerSelectorMutex;
 			ITunnelPeerSelector * m_CustomPeerSelector;
+			std::mt19937 m_Rng; // for tunnel selection
 
 			int m_MinLatency = 0; // if > 0 this tunnel pool will try building tunnels with minimum latency by ms
 			int m_MaxLatency = 0; // if > 0 this tunnel pool will try building tunnels with maximum latency by ms

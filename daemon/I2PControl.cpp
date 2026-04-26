@@ -257,10 +257,13 @@ namespace client
 						return; // TODO:
 					}
 					std::streamoff rem = contentLength + ss.tellg () - bytes_transferred; // more bytes to read
-					if (rem > 0)
+					while (rem > 0) // read in chunks to prevent buffer overflow
 					{
-						bytes_transferred = boost::asio::read (*socket, boost::asio::buffer (buf->data (), rem));
+						size_t toRead = std::min ((size_t)rem, buf->size ()); // don't exceed buffer size
+						bytes_transferred = boost::asio::read (*socket, boost::asio::buffer (buf->data (), toRead));
+						if (bytes_transferred == 0) break;
 						ss.write (buf->data (), bytes_transferred);
+						rem -= bytes_transferred;
 					}
 				}
 				std::ostringstream response;
@@ -405,7 +408,7 @@ namespace client
 	{
 		LogPrint (eLogInfo, "I2PControl: Shutdown requested");
 		InsertParam (results, "Shutdown", "");
-		m_ShutdownTimer.expires_from_now (boost::posix_time::seconds(1)); // 1 second to make sure response has been sent
+		m_ShutdownTimer.expires_after (std::chrono::seconds(1)); // 1 second to make sure response has been sent
 		m_ShutdownTimer.async_wait (
 			[](const boost::system::error_code& ecode)
 			{
@@ -419,7 +422,7 @@ namespace client
 		int timeout = i2p::tunnel::tunnels.GetTransitTunnelsExpirationTimeout ();
 		LogPrint (eLogInfo, "I2PControl: Graceful shutdown requested, ", timeout, " seconds remains");
 		InsertParam (results, "ShutdownGraceful", "");
-		m_ShutdownTimer.expires_from_now (boost::posix_time::seconds(timeout + 1)); // + 1 second
+		m_ShutdownTimer.expires_after (std::chrono::seconds(timeout + 1)); // + 1 second
 		m_ShutdownTimer.async_wait (
 			[](const boost::system::error_code& ecode)
 			{

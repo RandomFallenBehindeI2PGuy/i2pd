@@ -34,7 +34,7 @@ namespace i2p
 namespace transport
 {
 	NTCP2Establisher::NTCP2Establisher ():
-		m_SessionConfirmedBuffer (nullptr), m_BufferLen (0)
+		m_SessionConfirmedBuffer (nullptr), m_BufferLen (0), m_IsLongPadding (false)
 	{
         SetVersion (2);
 	}
@@ -60,6 +60,7 @@ namespace transport
             break;
             default:
                 m_CryptoType = i2p::data::CRYPTO_KEY_TYPE_ECIES_X25519_AEAD;
+                m_IsLongPadding = false;
         }
 #else
         m_CryptoType = i2p::data::CRYPTO_KEY_TYPE_ECIES_X25519_AEAD;
@@ -168,7 +169,9 @@ namespace transport
 		offset += 32;
 		// encryption key for next block
 		if (!KDF1Alice ()) return false;
-		size_t maxMsgLength = NTCP2_SESSION_REQUEST_MAX_SIZE;
+		size_t maxPaddingLength = m_IsLongPadding ? NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE : NTCP2_SESSION_HANDSHAKE_MAX_SIZE;
+		maxPaddingLength -= 64;
+		size_t maxMsgSize = m_MaxMsgSize;
 #if OPENSSL_PQ
         if (m_PQKeys)
         {
@@ -184,16 +187,20 @@ namespace transport
 			}
 			MixHash (m_Buffer + offset, keyLen + 16); // h = SHA256(h || ciphertext)
 			offset += keyLen + 16;
-			maxMsgLength += keyLen + 16;
+			maxPaddingLength = offset + 32; // 32 bytes following options block size
+			// adjust max msg size because we might send smaller message that we can receive
+			maxMsgSize = NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE + i2p::crypto::MLKEM1024_KEY_LENGTH + 16;
+			if (maxMsgSize > m_MaxMsgSize) maxMsgSize = m_MaxMsgSize;
         }
 #endif
         // calculate padding length
-		auto paddingLength = (offset + 32 < maxMsgLength) ? (rng () % (maxMsgLength - offset - 32)) : 0; // 32 bytes following options block size
+        if (offset + 32 + maxPaddingLength > maxMsgSize) maxPaddingLength = maxMsgSize - offset - 32;
+		auto paddingLength = maxPaddingLength ? rng () % maxPaddingLength : 0;
 		// fill options
 		uint8_t options[32]; // actual options size is 16 bytes
 		memset (options, 0, 16);
 		options[0] = i2p::context.GetNetID (); // network ID
-		options[1] = 2; // ver, always 2 regradless actual version
+		options[1] = 2; // ver, always 2 regardless actual version
 		htobe16buf (options + 2, paddingLength); // padLen
 		// calculate m3p2Len
 		auto riBuffer = i2p::context.CopyRouterInfoBuffer ();
@@ -239,7 +246,9 @@ namespace transport
 		offset += 32;
 		// encryption key for next block (m_K)
 		if (!KDF2Bob ()) return false;
-		size_t maxMsgLength = NTCP2_SESSION_CREATED_MAX_SIZE;
+		size_t maxPaddingLength = m_IsLongPadding ? NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE : NTCP2_SESSION_HANDSHAKE_MAX_SIZE;
+		maxPaddingLength -= 64;
+		size_t maxMsgSize = m_MaxMsgSize;
 #if OPENSSL_PQ
         if (m_PQKeys)
         {
@@ -255,13 +264,18 @@ namespace transport
 			MixHash (m_Buffer + offset, cipherTextLen + 16); // encrypt ML-KEM frame
 			MixKey (sharedSecret);
             offset += cipherTextLen + 16;
+            maxPaddingLength= offset + 32; // 32 bytes following options block size
+			// adjust max msg size because we might send smaller message that we can receive
+			maxMsgSize = NTCP2_SESSION_HANDSHAKE_LONG_MAX_SIZE + i2p::crypto::MLKEM1024_KEY_LENGTH + 16;
+			if (maxMsgSize > m_MaxMsgSize) maxMsgSize = m_MaxMsgSize;
         }
 #endif
-         // calculate padding length
-		auto paddingLen = (offset + 32 < maxMsgLength) ? (rng () % (maxMsgLength - offset - 32)) : 0; // 32 bytes following options block size
+		// calculate padding length
+		if (offset + 32 + maxPaddingLength > maxMsgSize) maxPaddingLength = maxMsgSize - offset - 32;
+		auto paddingLength = maxPaddingLength ? rng () % maxPaddingLength : 0;
 		uint8_t options[16];
 		memset (options, 0, 16);
-		htobe16buf (options + 2, paddingLen); // padLen
+		htobe16buf (options + 2, paddingLength); // padLen
 		htobe32buf (options + 8, (i2p::util::GetMillisecondsSinceEpoch () + 500)/1000); // tsB, rounded to seconds
 		// encrypt options
 		if (!Encrypt (options, m_Buffer + offset, 16))
@@ -272,12 +286,12 @@ namespace transport
 		MixHash (m_Buffer + offset, 32);	// encrypted options
 		offset += 32;
         // padding
-        if (paddingLen)
+        if (paddingLength)
         {
-            RAND_bytes (m_Buffer + offset, paddingLen);
-            MixHash (m_Buffer + offset, paddingLen);
+            RAND_bytes (m_Buffer + offset, paddingLength);
+            MixHash (m_Buffer + offset, paddingLength);
         }
-        m_BufferLen = offset + paddingLen;
+        m_BufferLen = offset + paddingLength;
 		return true;
 	}
 
@@ -380,6 +394,7 @@ namespace transport
 				paddingLen = bufbe16toh (options + 2);
 				m_BufferLen = paddingLen + offset;
 				// actual padding is not known yet, apply MixHash later
+				if (m_BufferLen > NTCP2_SESSION_HANDSHAKE_MAX_SIZE) m_IsLongPadding = true;
 				m3p2Len = bufbe16toh (options + 4);
 				if (m3p2Len < 16)
 				{
@@ -515,7 +530,8 @@ namespace transport
 #endif
 		m_NextReceivedLen (0), m_NextReceivedBuffer (nullptr), m_NextSendBuffer (nullptr),
 		m_NextReceivedBufferSize (0), m_ReceiveSequenceNumber (0), m_SendSequenceNumber (0),
-		m_IsSending (false), m_IsReceiving (false), m_NextPaddingSize (16)
+		m_IsSending (false), m_IsReceiving (false), m_NextRouterInfoResendTime (0),
+		m_NextPaddingSize (16)
 	{
 		if (in_RemoteRouter) // Alice
 		{
@@ -529,12 +545,12 @@ namespace transport
                 if (m_Server.GetVersion () > 2) // we support post quantum in config
                     m_Establisher->SetVersion (addr->v);
 #endif
+				if (addr->v > 2 && in_RemoteRouter->GetVersion () >= MAKE_VERSION_NUMBER(0, 9, 69)) // 0.9.69
+					m_Establisher->m_IsLongPadding = true;
 			}
 			else
 				LogPrint (eLogWarning, "NTCP2: Missing NTCP2 address");
 		}
-		m_NextRouterInfoResendTime = i2p::util::GetSecondsSinceEpoch () + NTCP2_ROUTERINFO_RESEND_INTERVAL +
-			m_Server.GetRng ()() % NTCP2_ROUTERINFO_RESEND_INTERVAL_THRESHOLD;
 	}
 
 	NTCP2Session::~NTCP2Session ()
@@ -549,9 +565,9 @@ namespace transport
 
 	void NTCP2Session::Terminate ()
 	{
-		if (!m_IsTerminated)
+		bool isTerminated = m_IsTerminated.exchange (true);
+		if (!isTerminated)
 		{
-			m_IsTerminated = true;
 			m_IsEstablished = false;
 			boost::system::error_code ec;
 			m_Socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
@@ -597,8 +613,11 @@ namespace transport
 	void NTCP2Session::Established ()
 	{
 		m_IsEstablished = true;
+		m_Version = (uint8_t)m_Establisher->m_CryptoType - 2;
 		m_Establisher.reset (nullptr);
 		SetTerminationTimeout (NTCP2_TERMINATION_TIMEOUT + m_Server.GetRng ()() % NTCP2_TERMINATION_TIMEOUT_VARIANCE);
+		m_NextRouterInfoResendTime = i2p::util::GetSecondsSinceEpoch () + NTCP2_ROUTERINFO_RESEND_INTERVAL +
+			m_Server.GetRng ()() % NTCP2_ROUTERINFO_RESEND_INTERVAL_VARIANCE;
 		SendQueue ();
 		transports.PeerConnected (shared_from_this ());
 	}
@@ -651,7 +670,7 @@ namespace transport
 
 	void NTCP2Session::SendSessionRequest ()
 	{
-		if (!m_Establisher->CreateSessionRequestMessage (m_Server.GetRng ()))
+		if (!m_Establisher->CreateSessionRequestMessage (m_Server.GetEstablisherRng ()))
 		{
 			LogPrint (eLogWarning, "NTCP2: Send SessionRequest KDF failed");
 			boost::asio::post (m_Server.GetService (), std::bind (&NTCP2Session::Terminate, shared_from_this ()));
@@ -725,11 +744,7 @@ namespace transport
 #endif
 			else if (paddingLen > 0)
 			{
-#if OPENSSL_PQ
-                if (len + paddingLen <= NTCP2_SESSION_REQUEST_MAX_SIZE + i2p::crypto::MLKEM1024_KEY_LENGTH + 16)
-#else
-				if (len + paddingLen <= NTCP2_SESSION_REQUEST_MAX_SIZE) // session request is 287 bytes max
-#endif
+				if (len + paddingLen <= m_Establisher->m_MaxMsgSize)
 				{
 					boost::asio::async_read (m_Socket, boost::asio::buffer(m_Establisher->m_Buffer + len, paddingLen), boost::asio::transfer_all (),
 						std::bind(&NTCP2Session::HandleSessionRequestPaddingReceived, shared_from_this (), std::placeholders::_1, std::placeholders::_2));
@@ -787,7 +802,7 @@ namespace transport
 
 	void NTCP2Session::SendSessionCreated ()
 	{
-		if (!m_Establisher->CreateSessionCreatedMessage (m_Server.GetRng ()))
+		if (!m_Establisher->CreateSessionCreatedMessage (m_Server.GetEstablisherRng ()))
 		{
 			LogPrint (eLogWarning, "NTCP2: Send SessionCreated KDF failed");
 			boost::asio::post (m_Server.GetService (), std::bind (&NTCP2Session::Terminate, shared_from_this ()));
@@ -825,7 +840,11 @@ namespace transport
 		{
 			if (paddingLen > 0)
 			{
-				if (paddingLen <= NTCP2_SESSION_CREATED_MAX_SIZE - 64) // session created is 287 bytes max
+#if OPENSSL_PQ
+				if (paddingLen <= m_Establisher->m_MaxMsgSize - 80)
+#else
+				if (paddingLen <= m_Establisher->m_MaxMsgSize - 64)
+#endif
 				{
 					boost::asio::async_read (m_Socket, boost::asio::buffer(m_Establisher->m_Buffer + m_Establisher->m_BufferLen, paddingLen), boost::asio::transfer_all (),
 						std::bind(&NTCP2Session::HandleSessionCreatedPaddingReceived, shared_from_this (), std::placeholders::_1, std::placeholders::_2));
@@ -1090,6 +1109,12 @@ namespace transport
 		if (m_Server.AddNTCP2Session (shared_from_this (), true))
 		{
 			Established ();
+			if (ri1->GetCongestion () == i2p::data::RouterInfo::eRejectAll)
+			{
+				auto terminationTimeout = GetTerminationTimeout ()/2;
+				if (terminationTimeout < NTCP2_ESTABLISH_TIMEOUT) terminationTimeout = NTCP2_ESTABLISH_TIMEOUT;
+				SetTerminationTimeout (terminationTimeout);
+			}
 			ReceiveLength ();
 		}
 		else
@@ -1120,6 +1145,8 @@ namespace transport
 
 	void NTCP2Session::ClientLogin ()
 	{
+		if (m_Establisher->m_CryptoType > i2p::data::CRYPTO_KEY_TYPE_ECIES_X25519_AEAD && !(m_Server.GetRng ()() & 0x03))
+			m_Establisher->SetVersion (2); // switch to non-PQ  with a probability of one in four
 		m_Establisher->CreateEphemeralKey ();
 		boost::asio::post (m_Server.GetEstablisherService (),
 		    [s = shared_from_this ()] ()
@@ -1285,6 +1312,7 @@ namespace transport
 							if (remoteIdentity && remoteIdentity->GetIdentHash () == newRi->GetIdentHash ())
 								// peer's RouterInfo update
 								SetRemoteIdentity (newRi->GetIdentity ());
+							i2p::transport::transports.UpdatePeerParams (newRi);
 						}
 					}
 					else
@@ -1467,10 +1495,10 @@ namespace transport
 			UpdateNumSentBytes (bytes_transferred);
 			i2p::transport::transports.UpdateSentBytes (bytes_transferred);
 			LogPrint (eLogDebug, "NTCP2: Next frame sent ", bytes_transferred);
-			if (GetLastActivityTimestamp () > m_NextRouterInfoResendTime)
+			if (GetLastActivityTimestamp () > m_NextRouterInfoResendTime && m_NextRouterInfoResendTime)
 			{
 				m_NextRouterInfoResendTime += NTCP2_ROUTERINFO_RESEND_INTERVAL +
-					m_Server.GetRng ()() % NTCP2_ROUTERINFO_RESEND_INTERVAL_THRESHOLD;
+					m_Server.GetRng ()() % NTCP2_ROUTERINFO_RESEND_INTERVAL_VARIANCE;
 				SendRouterInfo ();
 			}
 			else
@@ -1615,7 +1643,7 @@ namespace transport
 
 	void NTCP2Session::ReadSomethingAndTerminate ()
 	{
-		size_t len = m_Server.GetRng ()() % NTCP2_SESSION_REQUEST_MAX_SIZE;
+		size_t len = m_Server.GetRng ()() % NTCP2_SESSION_HANDSHAKE_MAX_SIZE;
 		if (len > 0 && m_Establisher)
 			boost::asio::async_read (m_Socket, boost::asio::buffer(m_Establisher->m_Buffer, len), boost::asio::transfer_all (),
 				[s = shared_from_this()](const boost::system::error_code& ecode, size_t bytes_transferred)
@@ -1690,6 +1718,7 @@ namespace transport
 		RunnableServiceWithWork ("NTCP2"), m_TerminationTimer (GetService ()),
 		m_ProxyType(eNoProxy), m_Resolver(GetService ()),
 		m_Rng(i2p::util::GetMonotonicMicroseconds ()%1000000LL),
+		m_EstablisherService (m_Rng ()),
 		m_Version (2)
 	{
 	}

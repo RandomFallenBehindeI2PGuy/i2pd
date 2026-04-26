@@ -313,11 +313,11 @@ if(NOT MSVC)
 # check for c++20 & c++17 support
   include(CheckCXXCompilerFlag)
 
-  if(Boost_VERSION VERSION_GREATER_EQUAL "1.83") # min boost version for c++20
+  if(Boost_VERSION VERSION_GREATER_EQUAL "1.81") # min boost version for c++20
     CHECK_CXX_COMPILER_FLAG("-std=c++20" CXX20_SUPPORTED)
   endif()
   CHECK_CXX_COMPILER_FLAG("-std=c++17" CXX17_SUPPORTED)
- 
+
 
   if(CXX20_SUPPORTED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
@@ -355,6 +355,8 @@ message(STATUS "  ADDRSANITIZER    : ${WITH_ADDRSANITIZER}")
 message(STATUS "  THREADSANITIZER  : ${WITH_THREADSANITIZER}")
 message(STATUS "  UNDEFSANITIZER   : ${WITH_UNDEFSANITIZER}")
 message(STATUS "---------------------------------------")
+
+target_link_libraries(libi2pd PUBLIC ZLIB::ZLIB OpenSSL::SSL OpenSSL::Crypto ${Boost_LIBRARIES} Threads::Threads)
 
 if(WITH_BINARY)
   if(WIN32)
