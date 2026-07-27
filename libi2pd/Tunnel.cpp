@@ -31,7 +31,7 @@ namespace tunnel
 {
 	Tunnel::Tunnel (std::shared_ptr<TunnelConfig> config):
 		TunnelBase (config->GetTunnelID (), config->GetNextTunnelID (), config->GetNextIdentHash ()),
-		m_Config (config), m_IsShortBuildMessage (false), m_Pool (nullptr),
+		m_Config (config), m_Pool (nullptr),
 		m_State (eTunnelStatePending), m_FarEndTransports (i2p::data::RouterInfo::eAllTransports),
 		m_IsRecreated (false), m_Latency (UNKNOWN_LATENCY)
 	{
@@ -53,8 +53,7 @@ namespace tunnel
 		int numRecords = numHops <= STANDARD_NUM_RECORDS ? STANDARD_NUM_RECORDS : MAX_NUM_RECORDS;
 		auto msg = numRecords <= STANDARD_NUM_RECORDS ? NewI2NPShortMessage () : NewI2NPMessage ();
 		*msg->GetPayload () = numRecords;
-		const size_t recordSize = m_Config->IsShort () ? SHORT_TUNNEL_BUILD_RECORD_SIZE : TUNNEL_BUILD_RECORD_SIZE;
-		msg->len += numRecords*recordSize + 1;
+		msg->len += numRecords*SHORT_TUNNEL_BUILD_RECORD_SIZE + 1;
 		// shuffle records
 		std::vector<int> recordIndicies;
 		for (int i = 0; i < numRecords; i++) recordIndicies.push_back(i);
@@ -78,7 +77,7 @@ namespace tunnel
 		for (int i = numHops; i < numRecords; i++)
 		{
 			int idx = recordIndicies[i];
-			RAND_bytes (records + idx*recordSize, recordSize);
+			RAND_bytes (records + idx*SHORT_TUNNEL_BUILD_RECORD_SIZE, SHORT_TUNNEL_BUILD_RECORD_SIZE);
 		}
 
 		// decrypt real records
@@ -97,7 +96,7 @@ namespace tunnel
 		// delete phony hop after encryption
 		if (insertPhonyRecord) m_Config->DeletePhonyHop ();
 
-		msg->FillI2NPMessageHeader (m_Config->IsShort () ? eI2NPShortTunnelBuild : eI2NPVariableTunnelBuild);
+		msg->FillI2NPMessageHeader (eI2NPShortTunnelBuild);
 		auto s = shared_from_this ();
 		msg->onDrop = [s]()
 			{
@@ -108,25 +107,20 @@ namespace tunnel
 		// send message
 		if (outboundTunnel)
 		{
-			if (m_Config->IsShort ())
+			auto ident = m_Config->GetFirstHop () ? m_Config->GetFirstHop ()->ident : nullptr;
+			if (ident && ident->GetIdentHash () != outboundTunnel->GetEndpointIdentHash ()) // don't encrypt if IBGW = OBEP
 			{
-				auto ident = m_Config->GetFirstHop () ? m_Config->GetFirstHop ()->ident : nullptr;
-				if (ident && ident->GetIdentHash () != outboundTunnel->GetEndpointIdentHash ()) // don't encrypt if IBGW = OBEP
-				{
-					auto msg1 = i2p::garlic::WrapECIESX25519MessageForRouter (msg, ident->GetEncryptionPublicKey ());
-					if (msg1) msg = msg1;
-				}
+				auto msg1 = i2p::garlic::WrapECIESX25519MessageForRouter (msg, ident->GetEncryptionPublicKey ());
+				if (msg1) msg = msg1;
 			}
 			outboundTunnel->SendTunnelDataMsgTo (GetNextIdentHash (), 0, msg);
 		}
 		else
 		{
-			if (m_Config->IsShort () && m_Config->GetLastHop () &&
-				m_Config->GetLastHop ()->ident->GetIdentHash () != m_Config->GetLastHop ()->nextIdent)
+			if (m_Config->GetLastHop () && m_Config->GetLastHop ()->ident->GetIdentHash () != m_Config->GetLastHop ()->nextIdent)
 			{
 				// add garlic key/tag for reply
-				uint8_t key[32];
-				uint64_t tag = m_Config->GetLastHop ()->GetGarlicKey (key);
+				auto [key, tag] = m_Config->GetLastHop ()->GetGarlicKey ();
 				if (m_Pool && m_Pool->GetLocalDestination ())
 					m_Pool->GetLocalDestination ()->SubmitECIESx25519Key (key, tag);
 				else
@@ -212,7 +206,6 @@ namespace tunnel
 				hop = hop->prev;
 				i++;
 			}
-			m_IsShortBuildMessage = m_Config->IsShort ();
 			m_FarEndTransports = m_Config->GetFarEndTransports ();
 			m_Config = nullptr;
 		}
@@ -504,37 +497,43 @@ namespace tunnel
 		return nullptr;
 	}
 
-	std::shared_ptr<InboundTunnel> Tunnels::GetNextInboundTunnel ()
+	template<typename TTunnel>
+	std::shared_ptr<TTunnel> Tunnels::GetRandomTunnel (const std::list<std::shared_ptr<TTunnel> >& tunnels)
 	{
-		std::shared_ptr<InboundTunnel> tunnel;
-		size_t minReceived = 0;
-		for (const auto& it : m_InboundTunnels)
+		if (tunnels.empty ()) return nullptr;
+		auto ind = m_Rng () % tunnels.size ();
+		auto it = tunnels.begin ();
+		std::advance (it, ind);
+		auto it1 = it;
+		// try after
+		while (it != tunnels.end ())
 		{
-			if (!it->IsEstablished ()) continue;
-			if (!tunnel || it->GetNumReceivedBytes () < minReceived)
+			if ((*it)->IsEstablished ())
+				return *it;
+			it++;
+		}
+		if (ind)
+		{
+			// try before
+			it = tunnels.begin ();
+			while (it != it1)
 			{
-				tunnel = it;
-				minReceived = it->GetNumReceivedBytes ();
+				if ((*it)->IsEstablished ())
+					return *it;
+				it++;
 			}
 		}
-		return tunnel;
+		return nullptr;
+	}
+
+	std::shared_ptr<InboundTunnel> Tunnels::GetNextInboundTunnel ()
+	{
+		return GetRandomTunnel (m_InboundTunnels);
 	}
 
 	std::shared_ptr<OutboundTunnel> Tunnels::GetNextOutboundTunnel ()
 	{
-		if (m_OutboundTunnels.empty ()) return nullptr;
-		uint32_t ind = m_Rng () % m_OutboundTunnels.size (), i = 0;
-		std::shared_ptr<OutboundTunnel> tunnel;
-		for (const auto& it: m_OutboundTunnels)
-		{
-			if (it->IsEstablished ())
-			{
-				tunnel = it;
-				i++;
-			}
-			if (i > ind && tunnel) break;
-		}
-		return tunnel;
+		return GetRandomTunnel (m_OutboundTunnels);
 	}
 
 	std::shared_ptr<TunnelPool> Tunnels::CreateTunnelPool (int numInboundHops,

@@ -11,6 +11,7 @@
 
 #include <inttypes.h>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -38,7 +39,7 @@ namespace client
 
 	struct UDPConnection
 	{
-		i2p::datagram::DatagramDestination * m_Destination;
+		std::shared_ptr<i2p::datagram::DatagramDestination> m_Destination;
 		std::weak_ptr<i2p::datagram::DatagramSession> m_LastDatagramSession;
 		uint64_t m_LastRepliableDatagramTime; // milliseconds
 		i2p::data::IdentHash Identity;
@@ -52,7 +53,7 @@ namespace client
 		bool m_IsSendingAllowed = true;
 		bool m_IsFirstPacket = true;
 
-		UDPConnection (boost::asio::io_context& service, i2p::datagram::DatagramDestination * destination):
+		UDPConnection (boost::asio::io_context& service, std::shared_ptr<i2p::datagram::DatagramDestination> destination):
 			m_Destination (destination), m_LastRepliableDatagramTime (0), m_AckTimer (service) {};
 		void SetIdentity (const i2p::data::IdentHash& ident) { Identity = ident; isIdentity = true; };
 
@@ -62,7 +63,6 @@ namespace client
 
 		void Acked (uint32_t seqn);
 		void ScheduleAckTimer (uint32_t seqn);
-		void DeleteExpiredUnackedDatagrams ();
 
 		std::shared_ptr<i2p::datagram::DatagramSession> GetDatagramSession ();
 	};
@@ -162,7 +162,7 @@ namespace client
 	{
 		public:
 
-			I2PUDPClientTunnel (const std::string & name, const std::string &remoteDest,
+			I2PUDPClientTunnel (std::string_view name, std::string_view remoteDest,
 				const boost::asio::ip::udp::endpoint& localEndpoint, std::shared_ptr<i2p::client::ClientDestination> localDestination,
 				uint16_t remotePort, bool gzip, i2p::datagram::DatagramVersion datagramVersion);
 			~I2PUDPClientTunnel ();
@@ -183,6 +183,7 @@ namespace client
 			const boost::asio::ip::udp::endpoint& GetLocalEndpoint () const { return m_LocalEndpoint; };
 
 			void ExpireStale (const uint64_t delta=I2P_UDP_SESSION_TIMEOUT);
+			void SetKeepAliveInterval (uint32_t keepAliveInterval);
 
 		private:
 
@@ -193,6 +194,9 @@ namespace client
 				const uint8_t * buf, size_t len, const i2p::util::Mapping * options);
 			void HandleRecvFromI2PRaw (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 			void TryResolving ();
+
+			void ScheduleKeepAliveTimer ();
+			void HandleKeepAliveTimer (const boost::system::error_code& ecode);
 
 		private:
 
@@ -211,6 +215,8 @@ namespace client
 			bool m_Gzip;
 			i2p::datagram::DatagramVersion m_DatagramVersion;
 			std::shared_ptr<UDPConvo> m_LastSession;
+			uint32_t m_KeepAliveInterval;
+			std::unique_ptr<boost::asio::steady_timer> m_KeepAliveTimer;
 
 		public:
 

@@ -225,25 +225,29 @@ namespace stream
 		{
 			uint16_t flags = packet->GetFlags ();
 			if (flags)
-				// plain ack with options
+			{
+				// plain ack with options or SYNACK retrans
 				ProcessOptions (flags, packet);
+				if (flags & PACKET_FLAG_SYNCHRONIZE)
+					SendQuickAck (); // to ack SYNACK retrans
+			}
 			else
+			{
 				// plain ack
+				LogPrint (eLogDebug, "Streaming: Plain ACK received");
+				if (m_IsImmediateAckRequested)
 				{
-					LogPrint (eLogDebug, "Streaming: Plain ACK received");
-					if (m_IsImmediateAckRequested)
+					auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+					if (m_IsFirstRttSample)
 					{
-						auto ts = i2p::util::GetMillisecondsSinceEpoch ();
-						if (m_IsFirstRttSample)
-						{
-							m_RTT = ts - m_LastSendTime;
-							m_IsFirstRttSample = false;
-						}
-						else
-							m_RTT = (m_RTT + (ts - m_LastSendTime)) / 2;
-						m_IsImmediateAckRequested = false;
+						m_RTT = ts - m_LastSendTime;
+						m_IsFirstRttSample = false;
 					}
+					else
+						m_RTT = (m_RTT + (ts - m_LastSendTime)) / 2;
+					m_IsImmediateAckRequested = false;
 				}
+			}
 			m_LocalDestination.DeletePacket (packet);
 			return;
 		}
@@ -681,7 +685,7 @@ namespace stream
 			else
 				payloadLen = 0;
 			p.len = payloadLen + 22;
-			SendPackets (std::vector<Packet *> { &p });
+			SendPackets ({ &p });
 			LogPrint (eLogDebug, "Streaming: Pong of ", p.len, " bytes sent");
 		}
 		m_LocalDestination.DeletePacket (packet);
@@ -692,7 +696,6 @@ namespace stream
 		bool acknowledged = false;
 		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
 		uint32_t ackThrough = packet->GetAckThrough ();
-		m_NACKedPackets.clear ();
 		if (ackThrough > m_SequenceNumber)
 		{
 			LogPrint (eLogError, "Streaming: Unexpected ackThrough=", ackThrough, " > seqn=", m_SequenceNumber);
@@ -704,6 +707,7 @@ namespace stream
 		m_IsNAcked = false;
 		m_IsResendNeeded = false;
 		int nackCount = packet->GetNACKCount ();
+		std::list<Packet *> newNACKedPackets;
 		for (auto it = m_SentPackets.begin (); it != m_SentPackets.end ();)
 		{
 			auto seqn = (*it)->GetSeqn ();
@@ -715,7 +719,7 @@ namespace stream
 					for (int i = 0; i < nackCount; i++)
 						if (seqn == packet->GetNACK (i))
 						{
-							m_NACKedPackets.insert (*it);
+							newNACKedPackets.push_back (*it);
 							m_IsNAcked = true;
 							nacked = true;
 							break;
@@ -723,7 +727,7 @@ namespace stream
 					if (nacked)
 					{
 						LogPrint (eLogDebug, "Streaming: Packet ", seqn, " NACK");
-						++it;
+						it++;
 						continue;
 					}
 				}
@@ -739,7 +743,7 @@ namespace stream
 				else if (!sentPacket->resent && seqn > m_TunnelsChangeSequenceNumber && rtt >= 0)
 					rttSample = std::min (rttSample, (int)rtt);
 				LogPrint (eLogDebug, "Streaming: Packet ", seqn, " acknowledged rtt=", rtt, " sentTime=", sentPacket->sendTime);
-				m_SentPackets.erase (it++);
+				it = m_SentPackets.erase (it);
 				m_LocalDestination.DeletePacket (sentPacket);
 				acknowledged = true;
 				ackPacketsCounter++;
@@ -749,6 +753,8 @@ namespace stream
 			else
 				break;
 		}
+		m_NACKedPackets.swap (newNACKedPackets);
+
 		if (m_LastACKRecieveTime)
 		{
 			uint64_t interval = ts - m_LastACKRecieveTime;
@@ -987,7 +993,7 @@ namespace stream
 				numMsgs = numPacketsToSend;
 		}
 		bool isNoAck = m_LastReceivedSequenceNumber < 0; // first packet
-		std::vector<Packet *> packets;
+		std::list<Packet *> packets;
 		while ((m_Status == eStreamStatusNew) || (IsEstablished () && !m_SendBuffer.IsEmpty () && numMsgs > 0))
 		{
 			Packet * p = m_LocalDestination.NewPacket ();
@@ -1039,10 +1045,14 @@ namespace stream
 					m_MTU = (m_RoutingSession && m_RoutingSession->IsRatchets ()) ? STREAMING_MTU_RATCHETS : STREAMING_MTU;
 				}
 				uint16_t flags = PACKET_FLAG_SYNCHRONIZE | PACKET_FLAG_FROM_INCLUDED | PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED;
-				if (!m_DontSign) flags |= PACKET_FLAG_SIGNATURE_INCLUDED;
 				if (isNoAck) flags |= PACKET_FLAG_NO_ACK;
-				bool isOfflineSignature = m_LocalDestination.GetOwner ()->GetPrivateKeys ().IsOfflineSignature ();
-				if (isOfflineSignature) flags |= PACKET_FLAG_OFFLINE_SIGNATURE;
+				bool isOfflineSignature = false;
+				if (!m_DontSign)
+				{
+					flags |= PACKET_FLAG_SIGNATURE_INCLUDED;
+					isOfflineSignature = m_LocalDestination.GetOwner ()->GetPrivateKeys ().IsOfflineSignature ();
+					if (isOfflineSignature) flags |= PACKET_FLAG_OFFLINE_SIGNATURE;
+				}
 				htobe16buf (packet + size, flags);
 				size += 2; // flags
 				size_t identityLen = m_LocalDestination.GetOwner ()->GetIdentity ()->GetFullLen ();
@@ -1096,7 +1106,8 @@ namespace stream
 				size += m_SendBuffer.Get(packet + size, m_MTU); // payload
 			}
 			p->len = size;
-			packets.push_back (p);
+			p->sendTime = ts;
+			packets.emplace_back (p);
 			numMsgs--;
 		}
 		if (m_SendBuffer.GetSize() == 0) m_IsBufferEmpty = true;
@@ -1109,20 +1120,16 @@ namespace stream
 				m_IsAckSendScheduled = false;
 				m_AckSendTimer.cancel ();
 			}
-			bool isEmpty = m_SentPackets.empty ();
-//			auto ts = i2p::util::GetMillisecondsSinceEpoch ();
-			for (auto& it: packets)
-			{
-				it->sendTime = ts;
-				m_SentPackets.insert (it);
-			}
 			SendPackets (packets);
 			m_LastSendTime = ts;
 			m_IsSendTime = false;
+			bool isEmpty = m_SentPackets.empty ();
+			m_SentPackets.splice (m_SentPackets.end (), packets);
 			if (m_RoutingSession)
 			{
 				int numSentPackets = m_RoutingSession->NumSentPackets ();
 				m_RoutingSession->SetNumSentPackets (numSentPackets + numPackets);
+				m_RoutingSession->SetLastSendTime (ts);
 			}
 			if (m_Status == eStreamStatusClosing && m_SendBuffer.IsEmpty ())
 				SendClose ();
@@ -1278,7 +1285,7 @@ namespace stream
 		size += 2; // options size
 		p.len = size;
 
-		SendPackets (std::vector<Packet *> { &p });
+		SendPackets ({ &p });
 		m_LastACKSendTime = ts; // for limit inbound speed
 		m_LastConfirmedReceivedSequenceNumber = lastReceivedSeqn; // for limit inbound speed
 		m_IsChoking2 = false;
@@ -1324,7 +1331,7 @@ namespace stream
 			m_LocalDestination.GetOwner ()->Sign (packet, size, signature);
 		}
 		p.len = size;
-		SendPackets (std::vector<Packet *> { &p });
+		SendPackets ({ &p });
 		LogPrint (eLogDebug, "Streaming: Ping of ", p.len, " bytes sent");
 	}
 
@@ -1377,10 +1384,14 @@ namespace stream
 		size++; // NACK count
 		packet[size] = 0;
 		size++; // resend delay
+		bool isOfflineSignature = false;
 		uint16_t flags = PACKET_FLAG_CLOSE;
-		if (!m_DontSign) flags |= PACKET_FLAG_SIGNATURE_INCLUDED;
-		bool isOfflineSignature = m_LocalDestination.GetOwner ()->GetPrivateKeys ().IsOfflineSignature ();
-		if (isOfflineSignature) flags |= PACKET_FLAG_OFFLINE_SIGNATURE;
+		if (!m_DontSign)
+		{
+			flags |= PACKET_FLAG_SIGNATURE_INCLUDED;
+			isOfflineSignature = m_LocalDestination.GetOwner ()->GetPrivateKeys ().IsOfflineSignature ();
+			if (isOfflineSignature) flags |= PACKET_FLAG_OFFLINE_SIGNATURE | PACKET_FLAG_FROM_INCLUDED;
+		}
 		htobe16buf (packet + size, flags);
 		size += 2; // flags
 		if (m_DontSign)
@@ -1390,18 +1401,23 @@ namespace stream
 		}
 		else
 		{
+			uint8_t * optionsSize = packet + size; // set options size later
+			size += 2; // options size
 			if (isOfflineSignature)
 			{
+				// we must include FROM  if offline signature for compatibility with Java-I2P
+				size_t identityLen = m_LocalDestination.GetOwner ()->GetIdentity ()->GetFullLen ();
+				m_LocalDestination.GetOwner ()->GetIdentity ()->ToBuffer (packet + size, identityLen);
+				size += identityLen; // from
 				const auto& offlineSignature = m_LocalDestination.GetOwner ()->GetPrivateKeys ().GetOfflineSignature ();
 				memcpy (packet + size, offlineSignature.data (), offlineSignature.size ());
 				size += offlineSignature.size (); // offline signature
 			}
 			size_t signatureLen = m_LocalDestination.GetOwner ()->GetPrivateKeys ().GetSignatureLen ();
-			htobe16buf (packet + size, signatureLen); // signature only
-			size += 2; // options size
-			uint8_t * signature = packet + size;
-			memset (packet + size, 0, signatureLen);
+			uint8_t * signature = packet + size; // set it later
+			memset (signature, 0, signatureLen); // zeroes for now
 			size += signatureLen; // signature
+			htobe16buf (optionsSize, packet + size - 2 - optionsSize); // actual options size
 			m_LocalDestination.GetOwner ()->Sign (packet, size, signature);
 		}
 
@@ -1444,9 +1460,9 @@ namespace stream
 				m_AckSendTimer.cancel ();
 			}
 			if (!packet->sendTime) packet->sendTime = i2p::util::GetMillisecondsSinceEpoch ();
-			SendPackets (std::vector<Packet *> { packet });
+			SendPackets ({ packet });
 			bool isEmpty = m_SentPackets.empty ();
-			m_SentPackets.insert (packet);
+			m_SentPackets.emplace_back (packet);
 			if (isEmpty)
 				ScheduleResend ();
 			return true;
@@ -1455,7 +1471,7 @@ namespace stream
 			return false;
 	}
 
-	void Stream::SendPackets (const std::vector<Packet *>& packets)
+	void Stream::SendPackets (const std::list<Packet *>& packets)
 	{
 		if (!m_RemoteLeaseSet)
 		{
@@ -1503,7 +1519,7 @@ namespace stream
 			ResetWindowSize ();
 		}
 		auto currentRemoteLease = m_CurrentRemoteLease;
-		if (!m_IsRemoteLeaseChangeInProgress && m_RemoteLeaseSet && m_CurrentRemoteLease && ts >= m_CurrentRemoteLease->endDate - i2p::data::LEASE_ENDDATE_THRESHOLD)
+		if (!m_IsRemoteLeaseChangeInProgress && m_RemoteLeaseSet && m_CurrentRemoteLease && ts + i2p::data::LEASE_ENDDATE_THRESHOLD >= m_CurrentRemoteLease->endDate)
 		{
 			auto leases = m_RemoteLeaseSet->GetNonExpiredLeases (false);
 			if (leases.size ())
@@ -1617,9 +1633,22 @@ namespace stream
 			{
 				if (m_PacingTime)
 				{
-					auto numPackets = std::lldiv (m_PacingTimeRem + ts*1000 - m_LastSendTime*1000, m_PacingTime);
-					m_NumPacketsToSend = numPackets.quot;
-					m_PacingTimeRem = numPackets.rem;
+					if (m_RoutingSession)
+					{
+						uint64_t lastSendTime = m_RoutingSession->LastSendTime ();
+						if (lastSendTime)
+						{
+							auto numPackets = std::lldiv (m_PacingTimeRem + ts*1000 - lastSendTime*1000, m_PacingTime);
+							m_NumPacketsToSend = numPackets.quot;
+							m_PacingTimeRem = numPackets.rem;
+						}
+						else
+						{
+							auto numPackets = std::lldiv (m_PacingTimeRem + ts*1000 - m_LastSendTime*1000, m_PacingTime);
+							m_NumPacketsToSend = numPackets.quot;
+							m_PacingTimeRem = numPackets.rem;
+						}
+					}
 				}
 				else
 				{
@@ -1627,7 +1656,7 @@ namespace stream
 					m_NumPacketsToSend = 1; m_PacingTimeRem = 0;
 				}
 				m_IsSendTime = true;
-				if (m_WindowIncCounter && (m_WindowSize < m_MaxWindowSize || m_WindowDropTargetSize) && !m_SendBuffer.IsEmpty () && m_PacingTime > m_MinPacingTime)
+				if (m_NumPacketsToSend && m_WindowIncCounter && (m_WindowSize < m_MaxWindowSize || m_WindowDropTargetSize) && !m_SendBuffer.IsEmpty () && m_PacingTime > m_MinPacingTime)
 				{
 					float winSize = m_WindowSize;
 					if (m_WindowDropTargetSize)
@@ -1711,7 +1740,8 @@ namespace stream
 	void Stream::ResendPacket ()
 	{
 		// check for resend attempts
-		if (m_IsIncoming && m_SequenceNumber == 1 && m_NumResendAttempts > 0)
+		if (m_IsIncoming && m_SequenceNumber == 1 && m_NumResendAttempts > 0 &&
+			(!m_RoutingSession || !m_RoutingSession->HasSharedRoutingPath ())) // ack not received
 		{
 			LogPrint (eLogWarning, "Streaming: SYNACK packet was not ACKed after ", m_NumResendAttempts, " attempts, terminate, rSID=", m_RecvStreamID, ", sSID=", m_SendStreamID);
 			m_Status = eStreamStatusReset;
@@ -1728,7 +1758,7 @@ namespace stream
 
 		// collect packets to resend
 		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
-		std::vector<Packet *> packets;
+		std::list<Packet *> packets;
 		if (m_IsNAcked && !m_IsClientChoked && !m_IsClientChoked2)
 		{
 			for (auto it : m_NACKedPackets)
@@ -1740,7 +1770,7 @@ namespace stream
 					else
 						it->resent = false;
 					it->sendTime = ts;
-					packets.push_back (it);
+					packets.emplace_back (it);
 					if ((int)packets.size () >= m_NumPacketsToSend) break;
 				}
 			}
@@ -1756,7 +1786,7 @@ namespace stream
 					else
 						it->resent = false;
 					it->sendTime = ts;
-					packets.push_back (it);
+					packets.emplace_back (it);
 					if (m_IsClientChoked2 && it->GetSeqn () == m_DropWindowDelaySequenceNumber)
 						m_IsClientChoked2 = false;
 					if ((int)packets.size () >= m_NumPacketsToSend) break;
@@ -1821,6 +1851,8 @@ namespace stream
 			if (m_IsTimeOutResend) ScheduleResend ();
 			SendPackets (packets);
 			m_LastSendTime = ts;
+			if (m_RoutingSession)
+				m_RoutingSession->SetLastSendTime (ts);
 			m_IsSendTime = false;
 		}
 		else if (!m_IsClientChoked && !m_IsClientChoked2)
@@ -2230,7 +2262,7 @@ namespace stream
 					it->second.push_back (packet);
 				else
 				{
-					m_SavedPackets[receiveStreamID] = std::list<Packet *>{ packet };
+					m_SavedPackets.emplace (receiveStreamID, std::list<Packet *>{ packet });
 					auto timer = std::make_shared<boost::asio::steady_timer> (m_Owner->GetService ());
 					timer->expires_after (std::chrono::seconds(PENDING_INCOMING_TIMEOUT));
 					auto s = shared_from_this ();

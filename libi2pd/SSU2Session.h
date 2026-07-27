@@ -186,6 +186,13 @@ namespace transport
 			int fragmentNum;
 			bool isLast;
 			std::shared_ptr<Fragment> next;
+
+			Fragment (const uint8_t * b, size_t l, int fn, bool last):
+				len (l), fragmentNum (fn), isLast (last)
+			{
+				if (len > SSU2_MAX_PACKET_SIZE) len = SSU2_MAX_PACKET_SIZE;
+				memcpy (buf, b, len);
+			}
 		};
 
 		std::shared_ptr<I2NPMessage> msg;
@@ -395,7 +402,7 @@ namespace transport
 			i2p::I2NPMessagesHandler m_Handler;
 			std::list<std::shared_ptr<I2NPMessage> > m_IntermediateQueue; // from transports
 			mutable std::mutex m_IntermediateQueueMutex;
-			bool m_IsDataReceived;
+			bool m_IsDataReceived, m_IsInvalidMessage;
 			double m_RTT;
 			int m_MsgLocalExpirationTimeout;
 			int m_MsgLocalSemiExpirationTimeout;

@@ -17,6 +17,7 @@
 #include <memory>
 #include <random>
 #include "Identity.h"
+#include "IdentMetrics.h"
 #include "LeaseSet.h"
 #include "RouterInfo.h"
 #include "I2NPProtocol.h"
@@ -43,7 +44,6 @@ namespace tunnel
 	struct Path
 	{
 		std::vector<Peer> peers;
-		bool isShort = true;
 		i2p::data::RouterInfo::CompatibleTransports farEndTransports = i2p::data::RouterInfo::eAllTransports;
 
 		void Add (std::shared_ptr<const i2p::data::RouterInfo> r);
@@ -70,6 +70,8 @@ namespace tunnel
 			void SetLocalDestination (std::shared_ptr<i2p::garlic::GarlicDestination> destination) { m_LocalDestination = destination; };
 			void SetExplicitPeers (std::vector<i2p::data::IdentHash> explicitPeers);
 			void SetTrustedRouters (std::vector<i2p::data::IdentHash> routers);
+			void SetInboundPeerOrderingKey (const uint8_t * key);
+			void SetOutboundPeerOrderingKey (const uint8_t * key);
 
 			void CreateTunnels ();
 			void TunnelCreated (std::shared_ptr<InboundTunnel> createdTunnel);
@@ -118,7 +120,7 @@ namespace tunnel
 			std::shared_ptr<OutboundTunnel> GetLowestLatencyOutboundTunnel(std::shared_ptr<OutboundTunnel> exclude = nullptr) const;
 
 			// for overriding tunnel peer selection
-			std::shared_ptr<const i2p::data::RouterInfo> SelectNextHop (std::shared_ptr<const i2p::data::RouterInfo> prevHop, bool reverse, bool endpoint) const;
+			std::shared_ptr<const i2p::data::RouterInfo> SelectNextHop (std::shared_ptr<const i2p::data::RouterInfo> prevHop, bool reverse, bool endpoint);
 			bool StandardSelectPeers(Path & path, int numHops, bool inbound, SelectHopFunc nextHop);
 
 		private:
@@ -127,7 +129,6 @@ namespace tunnel
 			void CreateTunnels (uint64_t ts);
 			void CreateInboundTunnel (uint64_t ts);
 			void CreateOutboundTunnel (uint64_t ts);
-			void CreatePairedInboundTunnel (std::shared_ptr<OutboundTunnel> outboundTunnel);
 			template<class TTunnels>
 			typename TTunnels::value_type GetNextTunnel (TTunnels& tunnels,
 				typename TTunnels::value_type excluded, i2p::data::RouterInfo::CompatibleTransports compatible);
@@ -153,6 +154,7 @@ namespace tunnel
 			std::mutex m_CustomPeerSelectorMutex;
 			ITunnelPeerSelector * m_CustomPeerSelector;
 			std::mt19937 m_Rng; // for tunnel selection
+			i2p::data::PeerOrdering m_InboundPeerOrdering, m_OutboundPeerOrdering;
 
 			int m_MinLatency = 0; // if > 0 this tunnel pool will try building tunnels with minimum latency by ms
 			int m_MaxLatency = 0; // if > 0 this tunnel pool will try building tunnels with maximum latency by ms

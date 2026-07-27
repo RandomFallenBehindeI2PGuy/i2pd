@@ -205,7 +205,6 @@ namespace client
 					if (ecode != boost::asio::error::operation_aborted)
 					{
 						LogPrint (eLogInfo, "UDP Connection: Packet ", m_AckTimerSeqn, " was not acked");
-//						DeleteExpiredUnackedDatagrams ();
 						m_IsSendingAllowed = false; // stop sending datagrams
 						m_AckTimerSeqn = 0;
 						m_RTT = 0;
@@ -219,19 +218,6 @@ namespace client
 					}
 				});
 		}
-	}
-
-	void UDPConnection::DeleteExpiredUnackedDatagrams ()
-	{
-		if (m_UnackedDatagrams.empty ()) return;
-		auto expired  = i2p::util::GetMillisecondsSinceEpoch () - (m_RTT ? 2*m_RTT : I2P_UDP_MAX_UNACKED_DATAGRAM_TIME);
-		auto it = m_UnackedDatagrams.begin ();
-		while (it != m_UnackedDatagrams.end ())
-		{
-			if (it->second < expired) break;
-			it++;
-		}
-		m_UnackedDatagrams.erase (m_UnackedDatagrams.begin (), it);
 	}
 
 	std::shared_ptr<i2p::datagram::DatagramSession> UDPConnection::GetDatagramSession ()
@@ -274,14 +260,9 @@ namespace client
 		{
 			if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
 			{
-				// window is full, try to delete expired unacked datagrams first
-				DeleteExpiredUnackedDatagrams ();
-				if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
-				{
-					// window is full, drop packet
-					Receive ();
-					return;
-				}
+				// window is full, drop packet
+				Receive ();
+				return;
 			}
 			LogPrint(eLogDebug, "UDPSession: Forward ", len, "B from ", FromEndpoint);
 			auto ts = i2p::util::GetMillisecondsSinceEpoch();
@@ -373,7 +354,10 @@ namespace client
 			dgram->ResetReceiver (m_inPort);
 			dgram->ResetRawReceiver (m_inPort);
 		}
-		m_Sessions.clear ();
+		{
+			std::lock_guard<std::mutex> lock (m_SessionsMutex);
+			m_Sessions.clear ();
+		}
 	}
 
 	std::vector<std::shared_ptr<DatagramSessionInfo> > I2PUDPServerTunnel::GetSessions ()
@@ -399,7 +383,7 @@ namespace client
 		return sessions;
 	}
 
-	I2PUDPClientTunnel::I2PUDPClientTunnel (const std::string & name, const std::string &remoteDest,
+	I2PUDPClientTunnel::I2PUDPClientTunnel (std::string_view name, std::string_view remoteDest,
 		const boost::asio::ip::udp::endpoint& localEndpoint,
 		std::shared_ptr<i2p::client::ClientDestination> localDestination,
 		uint16_t remotePort, bool gzip, i2p::datagram::DatagramVersion datagramVersion) :
@@ -440,10 +424,15 @@ namespace client
 		if (m_ResolveThread == nullptr)
 			m_ResolveThread = new std::thread (std::bind (&I2PUDPClientTunnel::TryResolving, this));
 		RecvFromLocal ();
+
+		if (m_KeepAliveInterval)
+			ScheduleKeepAliveTimer ();
 	}
 
 	void I2PUDPClientTunnel::Stop ()
 	{
+		if (m_KeepAliveTimer) m_KeepAliveTimer->cancel ();
+
 		auto dgram = m_LocalDest->GetDatagramDestination ();
 		if (dgram)
 		{
@@ -452,7 +441,10 @@ namespace client
 		}
 		m_cancel_resolve = true;
 
-		m_Sessions.clear();
+		{
+			std::lock_guard<std::mutex> lock (m_SessionsMutex);
+			m_Sessions.clear();
+		}
 
 		if(m_LocalSocket && m_LocalSocket->is_open ())
 			m_LocalSocket->close ();
@@ -496,6 +488,7 @@ namespace client
 				//  reset session
 				m_IsFirstPacket = true;
 				m_IsSendingAllowed = true;
+				m_UnackedDatagrams.clear ();
 				m_AckTimerSeqn = 0;
 				m_RTT = 0;
 			}
@@ -507,18 +500,14 @@ namespace client
 		}
 		if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
 		{
-			// window is full, try to delete expired unacked datagrams first
-			DeleteExpiredUnackedDatagrams ();
-			if (!m_UnackedDatagrams.empty () && m_NextSendPacketNum > m_UnackedDatagrams.front ().first + I2P_UDP_MAX_NUM_UNACKED_DATAGRAMS)
-			{
-				// window is still full, drop packet
-				RecvFromLocal ();
-				return;
-			}
+			// window is full, drop packet
+			RecvFromLocal ();
+			return;
 		}
 		auto remotePort = m_RecvEndpoint.port ();
 		if (!m_LastPort || m_LastPort != remotePort)
 		{
+			std::lock_guard<std::mutex> lock (m_SessionsMutex);
 			auto itr = m_Sessions.find (remotePort);
 			if (itr != m_Sessions.end ())
 				m_LastSession = itr->second;
@@ -660,25 +649,58 @@ namespace client
 
 	void I2PUDPClientTunnel::HandleRecvFromI2PRaw (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len)
 	{
-		auto itr = m_Sessions.find (toPort);
-		// found convo ?
-		if (itr != m_Sessions.end ())
+		std::shared_ptr<UDPConvo> convo;
+		{
+			std::lock_guard<std::mutex> lock (m_SessionsMutex);
+			auto itr = m_Sessions.find (toPort);
+			// found convo ?
+			if (itr != m_Sessions.end ())
+				convo = itr->second;
+		}
+		if (convo)
 		{
 			// found convo
 			if (len > 0)
 			{
 				LogPrint (eLogDebug, "UDP Client: Got ", len, "B from ", isIdentity ? Identity.ToBase32 () : "");
 				boost::system::error_code ec;
-				m_LocalSocket->send_to (boost::asio::buffer (buf, len), itr->second->first, 0, ec);
+				m_LocalSocket->send_to (boost::asio::buffer (buf, len), convo->first, 0, ec);
 				if (!ec)
 					// mark convo as active
-					itr->second->second = i2p::util::GetMillisecondsSinceEpoch ();
+					convo->second = i2p::util::GetMillisecondsSinceEpoch ();
 				else
-					LogPrint (eLogInfo, "UDP Client: Send exception: ", ec.message (), " to ", itr->second->first);
+					LogPrint (eLogInfo, "UDP Client: Send exception: ", ec.message (), " to ", convo->first);
 			}
 		}
 		else
 			LogPrint (eLogWarning, "UDP Client: Not tracking udp session using port ", (int) toPort);
+	}
+
+	void I2PUDPClientTunnel::SetKeepAliveInterval (uint32_t keepAliveInterval)
+	{
+		m_KeepAliveInterval = keepAliveInterval;
+		if (m_KeepAliveInterval)
+			m_KeepAliveTimer.reset (new boost::asio::steady_timer (m_LocalDest->GetService ()));
+	}
+
+	void I2PUDPClientTunnel::ScheduleKeepAliveTimer ()
+	{
+		if (m_KeepAliveTimer)
+		{
+			m_KeepAliveTimer->expires_after (std::chrono::seconds (m_KeepAliveInterval));
+			m_KeepAliveTimer->async_wait (std::bind (&I2PUDPClientTunnel::HandleKeepAliveTimer,
+				this, std::placeholders::_1));
+		}
+	}
+
+	void I2PUDPClientTunnel::HandleKeepAliveTimer (const boost::system::error_code& ecode)
+	{
+		if (ecode != boost::asio::error::operation_aborted)
+		{
+			if (i2p::util::GetMillisecondsSinceEpoch () > m_LastRepliableDatagramTime + m_KeepAliveInterval*1000)
+				HandleRecvFromLocal (boost::system::error_code(), 0); // send empty packet like it was received from local
+			ScheduleKeepAliveTimer ();
+		}
 	}
 }
 }

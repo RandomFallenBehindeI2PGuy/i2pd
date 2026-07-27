@@ -28,7 +28,7 @@ namespace garlic
 {
 	GarlicRoutingSession::GarlicRoutingSession (GarlicDestination * owner, bool attachLeaseSet):
 		m_Owner (owner), m_LeaseSetUpdateStatus (attachLeaseSet ? eLeaseSetUpdated : eLeaseSetDoNotSend),
-		m_LeaseSetUpdateMsgID (0), m_IsWithJava (false), m_NumSentPackets (0)
+		m_LeaseSetUpdateMsgID (0), m_IsWithJava (false), m_NumSentPackets (0), m_LastSendTime (0)
 	{
 	}
 
@@ -471,13 +471,6 @@ namespace garlic
 		}
 	}
 
-	void GarlicDestination::AddECIESx25519Key (const uint8_t * key, const uint8_t * tag)
-	{
-		uint64_t t;
-		memcpy (&t, tag, 8);
-		AddECIESx25519Key (key, t);
-	}
-
 	void GarlicDestination::AddECIESx25519Key (const uint8_t * key, uint64_t tag)
 	{
 		auto tagset = std::make_shared<SymmetricKeyTagSet>(this, key);
@@ -507,11 +500,8 @@ namespace garlic
 		auto mod = length & 0x0f; // %16
 		buf += 4; // length
 
-		bool found = false;
-		bool supportsRatchets = SupportsRatchets ();
-		if (supportsRatchets)
-			// try ECIESx25519 tag
-			found = HandleECIESx25519TagMessage (buf, length);
+		// try ECIESx25519 tag, might be used even is ratchets not supported
+		bool found = HandleECIESx25519TagMessage (buf, length);
 		if (!found)
 		{
 			auto it = !mod ? m_Tags.find (SessionTag(buf)) : m_Tags.end (); // AES block is multiple of 16
@@ -546,7 +536,7 @@ namespace garlic
 					decryption->Decrypt(buf + 514, length - 514, iv, buf + 514);
 					HandleAESBlock (buf + 514, length - 514, decryption, msg->from);
 				}
-				else if (supportsRatchets)
+				else if (SupportsRatchets ())
 				{
 					// otherwise ECIESx25519
 					auto ts = i2p::util::GetMillisecondsSinceEpoch ();
@@ -1031,7 +1021,7 @@ namespace garlic
 			{
 				LogPrint (eLogDebug, "Garlic: Type local");
 				I2NPMessageType typeID = (I2NPMessageType)(buf[0]); buf++; // typeid
-				int32_t msgID = bufbe32toh (buf); buf += 4; // msgID
+				uint32_t msgID = bufbe32toh (buf); buf += 4; // msgID
 				buf += 4; // expiration
 				ptrdiff_t offset = buf - buf1;
 				if (offset <= (int)len)

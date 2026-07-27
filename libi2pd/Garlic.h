@@ -132,12 +132,16 @@ namespace garlic
 
 			std::shared_ptr<GarlicRoutingPath> GetSharedRoutingPath ();
 			void SetSharedRoutingPath (std::shared_ptr<GarlicRoutingPath> path);
+			bool HasSharedRoutingPath () const { return (bool)m_SharedRoutingPath; }
 
 			bool IsWithJava () const { return m_IsWithJava; }
 			void SetIsWithJava (bool isWithJava) { m_IsWithJava = isWithJava; }
 
 			int NumSentPackets () const { return m_NumSentPackets; }
 			void SetNumSentPackets (int numSentPackets) { m_NumSentPackets = numSentPackets; }
+
+			uint64_t LastSendTime () const { return m_LastSendTime; }
+			void SetLastSendTime (uint64_t lastSendTime) { m_LastSendTime = lastSendTime; }
 
 			GarlicDestination * GetOwner () const { return m_Owner; }
 			void SetOwner (GarlicDestination * owner) { m_Owner = owner; }
@@ -163,6 +167,7 @@ namespace garlic
 			std::shared_ptr<GarlicRoutingPath> m_SharedRoutingPath;
 			bool m_IsWithJava; // based on choked value from streaming
 			int m_NumSentPackets; // for limit number of sent messages in streaming
+			uint64_t m_LastSendTime; // for limit OB speed in streaming
 
 		public:
 
@@ -289,7 +294,6 @@ namespace garlic
 
 		protected:
 
-			void AddECIESx25519Key (const uint8_t * key, const uint8_t * tag); // one tag
 			bool HandleECIESx25519TagMessage (uint8_t * buf, size_t len); // return true if found
 			virtual void HandleI2NPMessage (const uint8_t * buf, size_t len) = 0; // called from clove only
 			virtual bool HandleCloveI2NPMessage (I2NPMessageType typeID, const uint8_t * payload,

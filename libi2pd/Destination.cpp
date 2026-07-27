@@ -41,7 +41,7 @@ namespace client
 		int numTags = DEFAULT_TAGS_TO_SEND;
 		bool isHighBandwidth = true;
 		std::shared_ptr<std::vector<i2p::data::IdentHash> > explicitPeers;
-		std::string_view explicitPeersStr, trustedRoutersStr;
+		std::string_view explicitPeersStr, trustedRoutersStr, inboundRandomKeyStr, outboundRandomKeyStr;
 		try
 		{
 			if (params)
@@ -63,6 +63,8 @@ namespace client
 				}
 				explicitPeersStr = (*params)[I2CP_PARAM_EXPLICIT_PEERS];
 				trustedRoutersStr = (*params)[I2CP_PARAM_TRUSTED_ROUTERS];
+				inboundRandomKeyStr = (*params)[I2CP_PARAM_INBOUND_RANDOM_KEY];
+				outboundRandomKeyStr = (*params)[I2CP_PARAM_OUTBOUND_RANDOM_KEY];
 				m_Nickname = (*params)[I2CP_PARAM_INBOUND_NICKNAME];
 				if (m_Nickname.empty ()) // try outbound
 					m_Nickname = (*params)[I2CP_PARAM_OUTBOUND_NICKNAME];
@@ -108,6 +110,18 @@ namespace client
 			m_Pool->SetExplicitPeers (i2p::data::ExtractIdentHashes (explicitPeersStr));
 		if (!trustedRoutersStr.empty ())
 			m_Pool->SetTrustedRouters (i2p::data::ExtractIdentHashes (trustedRoutersStr));
+		if (!inboundRandomKeyStr.empty ())
+		{
+			uint8_t key[32]; // might be 32 bytes, but only first 16 bytes are used
+			if (i2p::data::Base64ToByteStream (inboundRandomKeyStr, key, 32) >= 16)
+				m_Pool->SetInboundPeerOrderingKey (key);
+		}
+		if (!outboundRandomKeyStr.empty ())
+		{
+			uint8_t key[32]; // might be 32 bytes, but only first 16 bytes are used
+			if (i2p::data::Base64ToByteStream (outboundRandomKeyStr, key, 32) >= 16)
+				m_Pool->SetOutboundPeerOrderingKey (key);
+		}
 		if(params)
 		{
 			int maxLatency = 0;
@@ -431,7 +445,11 @@ namespace client
 				{
 					// add or replace
 					if (buf[DATABASE_STORE_TYPE_OFFSET] == i2p::data::NETDB_STORE_TYPE_LEASESET)
+					{
 						leaseSet = std::make_shared<i2p::data::LeaseSet> (buf + offset, len - offset); // LeaseSet
+						if (!SupportsEncryptionType (i2p::data::CRYPTO_KEY_TYPE_ELGAMAL))
+							leaseSet->SetIsIncompatibleCrypto (true);
+					}
 					else
 					{
 						leaseSet = std::make_shared<i2p::data::LeaseSet2> (buf[DATABASE_STORE_TYPE_OFFSET],
@@ -863,18 +881,14 @@ namespace client
 			request->excluded.insert (nextFloodfill->GetIdentHash ());
 			request->requestTimeoutTimer.cancel ();
 
-			bool isECIES = SupportsEncryptionType (i2p::data::CRYPTO_KEY_TYPE_ECIES_X25519_AEAD) &&
-				nextFloodfill->GetVersion () >= MAKE_VERSION_NUMBER(0, 9, 46); // >= 0.9.46;
-			uint8_t replyKey[32], replyTag[32];
+			uint8_t replyKey[32];
+			uint64_t replyTag;
 			RAND_bytes (replyKey, 32); // random session key
-			RAND_bytes (replyTag, isECIES ? 8 : 32); // random session tag
-			if (isECIES)
-				AddECIESx25519Key (replyKey, replyTag);
-			else
-				AddSessionKey (replyKey, replyTag);
+			RAND_bytes ((uint8_t *)&replyTag, 8); // random session tag
+			AddECIESx25519Key (replyKey, replyTag);
 
 			auto msg = WrapMessageForRouter (nextFloodfill,
-				CreateLeaseSetDatabaseLookupMsg (dest, request->excluded, request->replyTunnel, replyKey, replyTag, isECIES));
+				CreateLeaseSetDatabaseLookupMsg (dest, request->excluded, request->replyTunnel, replyKey, replyTag));
 			auto s = shared_from_this ();
 			msg->onDrop = [s, dest, request]()
 				{
@@ -979,8 +993,7 @@ namespace client
 		m_StreamingMaxWindowSize (i2p::stream::MAX_WINDOW_SIZE),
 		m_StreamingMaxResends (i2p::stream::MAX_NUM_RESEND_ATTEMPTS),
 		m_IsStreamingAnswerPings (DEFAULT_ANSWER_PINGS), m_IsStreamingDontSign (DEFAULT_DONT_SIGN),
-		m_LastPort (0), m_DatagramDestination (nullptr), m_RefCounter (0),
-		m_LastPublishedTimestamp (0), m_ReadyChecker(service)
+		m_LastPort (0), m_RefCounter (0), m_LastPublishedTimestamp (0), m_ReadyChecker(service)
 	{
 		if (keys.IsOfflineSignature () && GetLeaseSetType () == i2p::data::NETDB_STORE_TYPE_LEASESET)
 			SetLeaseSetType (i2p::data::NETDB_STORE_TYPE_STANDARD_LEASESET2); // offline keys can be published with LS2 only
@@ -1101,6 +1114,9 @@ namespace client
 
 	void ClientDestination::Start ()
 	{
+		// Idempotent: a second Start() on a running destination must not re-create
+		// m_StreamingDestination (orphaning the live one) nor re-arm leaseset/pool.
+		if (m_StreamingDestination) return;
 		LeaseSetDestination::Start ();
 		m_StreamingDestination = std::make_shared<i2p::stream::StreamingDestination> (GetSharedFromThis ()); // TODO:
 		m_StreamingDestination->Start ();
@@ -1129,7 +1145,6 @@ namespace client
 		if (m_DatagramDestination)
 		{
 			LogPrint(eLogDebug, "Destination: -> Stopping Datagram Destination");
-			delete m_DatagramDestination;
 			m_DatagramDestination = nullptr;
 		}
 		LeaseSetDestination::Stop ();
@@ -1151,6 +1166,27 @@ namespace client
 				it.second->CreateDecryptor ();
 			}
 		if (m_StreamingDestination) m_StreamingDestination->Start ();
+	}
+
+	void ClientDestination::UpdateOfflineSignature (const i2p::data::PrivateKeys& keys)
+	{
+		// Adopt a newer offline transient of the same identity in place, on the
+		// destination's service so it stays single-threaded with LeaseSet and stream
+		// signing. Only the transient is refreshed, the identity is unchanged.
+		if (!keys.IsOfflineSignature ()) return;
+		boost::asio::post (GetService (), [s = GetSharedFromThis (), keys]()
+		{
+			if (!s->m_Keys.IsOfflineSignature ()) return;
+			if (keys.GetPublic ()->GetIdentHash () != s->GetIdentHash ()) return;
+			const auto& next = keys.GetOfflineSignature ();
+			const auto& cur = s->m_Keys.GetOfflineSignature ();
+			if (next == cur) return; // same transient
+			if (bufbe32toh (next.data ()) < bufbe32toh (cur.data ())) return; // do not shorten validity
+			LogPrint (eLogInfo, "Destination: Refreshing offline signature for ",
+				s->GetIdentHash ().ToBase32 (), ", transient expires ", bufbe32toh (next.data ()));
+			s->m_Keys.UpdateOfflineSignature (keys);
+			s->UpdateLeaseSet ();
+		});
 	}
 
 	void ClientDestination::HandleDataMessage (const uint8_t * buf, size_t len,
@@ -1209,7 +1245,7 @@ namespace client
 		auto leaseSet = FindLeaseSet (dest);
 		if (leaseSet)
 		{
-			auto stream = CreateStream (leaseSet, port);
+			auto stream = (!leaseSet->IsIncompatibleCrypto ()) ? CreateStream (leaseSet, port) : nullptr;
 			boost::asio::post (GetService (), [streamRequestComplete, stream]()
 				{
 					streamRequestComplete(stream);
@@ -1221,7 +1257,7 @@ namespace client
 			RequestDestination (dest,
 				[s, streamRequestComplete, port](std::shared_ptr<const i2p::data::LeaseSet> ls)
 				{
-					if (ls)
+					if (ls && !ls->IsIncompatibleCrypto ())
 						streamRequestComplete(s->CreateStream (ls, port));
 					else
 						streamRequestComplete (nullptr);
@@ -1240,7 +1276,7 @@ namespace client
 		RequestDestinationWithEncryptedLeaseSet (dest,
 			[s, streamRequestComplete, port](std::shared_ptr<i2p::data::LeaseSet> ls)
 			{
-				if (ls)
+				if (ls && !ls->IsIncompatibleCrypto ())
 					streamRequestComplete(s->CreateStream (ls, port));
 				else
 					streamRequestComplete (nullptr);
@@ -1382,14 +1418,14 @@ namespace client
 		return nullptr;
 	}
 
-	i2p::datagram::DatagramDestination * ClientDestination::CreateDatagramDestination (bool gzip,
+	std::shared_ptr<i2p::datagram::DatagramDestination> ClientDestination::CreateDatagramDestination (bool gzip,
 		i2p::datagram::DatagramVersion version)
 	{
 		if (!m_DatagramDestination)
 		{
 			if (!GetNumRatchetInboundTags ())
 				SetNumRatchetInboundTags (i2p::garlic::ECIESX25519_MAX_NUM_GENERATED_TAGS); // set max tags if not specified
-			m_DatagramDestination = new i2p::datagram::DatagramDestination (GetSharedFromThis (), gzip, version);
+			m_DatagramDestination = std::make_shared<i2p::datagram::DatagramDestination> (GetSharedFromThis (), gzip, version);
 		}
 		return m_DatagramDestination;
 	}

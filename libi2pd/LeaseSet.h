@@ -81,6 +81,8 @@ namespace data
 			const uint8_t * GetBuffer () const { return m_Buffer; };
 			size_t GetBufferLen () const { return m_BufferLen; };
 			bool IsValid () const { return m_IsValid; };
+			bool IsIncompatibleCrypto () const { return m_IsIncompatibleCrypto; };
+			void SetIsIncompatibleCrypto (bool isIncompatibleCrypto) { m_IsIncompatibleCrypto = isIncompatibleCrypto; };
 			const std::vector<std::shared_ptr<const Lease> > GetNonExpiredLeases (bool withThreshold = true) const;
 			const std::vector<std::shared_ptr<const Lease> > GetNonExpiredLeasesExcluding (LeaseInspectFunc exclude, bool withThreshold = true) const;
 			bool HasExpiredLeases () const;
@@ -125,7 +127,7 @@ namespace data
 
 		private:
 
-			bool m_IsValid, m_StoreLeases; // we don't need to store leases for floodfill
+			bool m_IsValid, m_IsIncompatibleCrypto, m_StoreLeases; // we don't need to store leases for floodfill
 			std::set<std::shared_ptr<Lease>, LeaseCmp> m_Leases;
 			uint64_t m_ExpirationTime; // in milliseconds
 			std::shared_ptr<const IdentityEx> m_Identity;
@@ -152,7 +154,8 @@ namespace data
 	{
 		public:
 
-			LeaseSet2 (uint8_t storeType): LeaseSet (true), m_StoreType (storeType) {}; // for update
+			LeaseSet2 (uint8_t storeType): LeaseSet (true), m_StoreType (storeType),
+				m_EncryptionType (0), m_PreferredEncryptionType (0) {}; // for HTTPServer only
 			LeaseSet2 (uint8_t storeType, const uint8_t * buf, size_t len, bool storeLeases = true,
 				std::shared_ptr<LocalDestination> dest = nullptr, CryptoKeyType preferredCrypto = CRYPTO_KEY_TYPE_ECIES_X25519_AEAD);
 			LeaseSet2 (const uint8_t * buf, size_t len, std::shared_ptr<const BlindedPublicKey> key,
@@ -192,6 +195,7 @@ namespace data
 			bool m_IsPublic = true, m_IsPublishedEncrypted = false;
 			std::shared_ptr<i2p::crypto::Verifier> m_TransientVerifier;
 			CryptoKeyType m_EncryptionType;
+			const CryptoKeyType m_PreferredEncryptionType;
 			std::shared_ptr<i2p::crypto::CryptoKeyEncryptor> m_Encryptor; // for standardLS2
 			i2p::util::Mapping m_Properties;
 	};

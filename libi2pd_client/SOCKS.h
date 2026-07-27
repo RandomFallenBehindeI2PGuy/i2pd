@@ -11,6 +11,9 @@
 
 #include <memory>
 #include <set>
+#include <map>
+#include <string>
+#include <string_view>
 #include <boost/asio.hpp>
 #include <mutex>
 #include "I2PService.h"
@@ -31,6 +34,10 @@ namespace proxy
 			boost::asio::ip::udp::endpoint GetNextLocalUDPEndpoint ();
 			void ReleaseLocalUDPPort (uint16_t port);
 
+			std::string_view GetResolvedAddress (const boost::asio::ip::address_v4& addr) const;
+			const boost::asio::ip::address_v4& ResolveAddress (std::string_view resolved);
+			bool HasResolvedAddresses () const { return !m_Resolved.empty (); }
+
 		protected:
 
 			// Implements TCPIPAcceptor
@@ -44,6 +51,7 @@ namespace proxy
 			uint16_t m_UpstreamProxyPort;
 			bool m_UseUpstreamProxy;
 			std::set<uint16_t> m_UDPPorts;
+			std::map<boost::asio::ip::address_v4, std::pair<std::string, uint64_t> > m_Resolved; // for torsocks, addr4->(i2p address, resolve time in milliseconds)
 	};
 
 	typedef SOCKSServer SOCKSProxy;

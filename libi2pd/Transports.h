@@ -17,7 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <queue>
+#include <list>
 #include <string>
 #include <memory>
 #include <atomic>
@@ -29,42 +29,40 @@
 #include "RouterInfo.h"
 #include "I2NPProtocol.h"
 #include "Identity.h"
+#include "IdentMetrics.h"
 #include "util.h"
 
 namespace i2p
 {
 namespace transport
 {
-	template<typename Keys>
-	class EphemeralKeysSupplier
+	class X25519KeysPairSupplier
 	{
-	// called from this file only, so implementation is in Transports.cpp
 		public:
 
-			EphemeralKeysSupplier (int size);
-			~EphemeralKeysSupplier ();
+			X25519KeysPairSupplier (int size);
+			~X25519KeysPairSupplier ();
 			void Start ();
 			void Stop ();
-			std::shared_ptr<Keys> Acquire ();
-			void Return (std::shared_ptr<Keys> pair);
+			std::shared_ptr<i2p::crypto::X25519Keys> Acquire ();
+			void Return (std::shared_ptr<i2p::crypto::X25519Keys> pair);
 
 		private:
 
 			void Run ();
-			void CreateEphemeralKeys (int num);
+			size_t CreateEphemeralKeys (int num); // return new queue size
 
 		private:
 
 			const int m_QueueSize;
-			i2p::util::MemoryPoolMt<Keys> m_KeysPool;
-			std::queue<std::shared_ptr<Keys> > m_Queue;
+			i2p::util::MemoryPoolMt<i2p::crypto::X25519Keys> m_KeysPool;
+			std::list<std::shared_ptr<i2p::crypto::X25519Keys> > m_Queue;
 
 			bool m_IsRunning;
 			std::unique_ptr<std::thread> m_Thread;
 			std::condition_variable m_Acquired;
 			std::mutex m_AcquiredMutex;
 	};
-	typedef EphemeralKeysSupplier<i2p::crypto::X25519Keys> X25519KeysPairSupplier;
 
 	const int PEER_ROUTER_INFO_UPDATE_INTERVAL = 31*60; // in seconds
 	const int PEER_ROUTER_INFO_UPDATE_INTERVAL_VARIANCE = 7*60; // in seconds
@@ -78,23 +76,34 @@ namespace transport
 		uint64_t creationTime, nextRouterInfoUpdateTime, lastSelectionTime;
 		std::list<std::shared_ptr<i2p::I2NPMessage> > delayedMessages;
 		std::vector<i2p::data::RouterInfo::SupportedTransports> priority;
-		bool isHighBandwidth, isEligible;
+		bool isHighBandwidth, isEligible, isDone;
 
 		Peer (std::shared_ptr<const i2p::data::RouterInfo> r, uint64_t ts):
 			numAttempts (0), router (r), creationTime (ts),
 			nextRouterInfoUpdateTime (ts + PEER_ROUTER_INFO_UPDATE_INTERVAL),
-			lastSelectionTime (0), isHighBandwidth (false), isEligible (false)
+			lastSelectionTime (0), isHighBandwidth (false), isEligible (false), isDone (false)
 		{
 			UpdateParams (router);
 		}
 
 		void Done ()
 		{
-			for (auto& it: sessions)
-				it->Done ();
+			isDone = true;
+			if (!sessions.empty ())
+			{
+				for (auto& it: sessions)
+					it->Done ();
+				decltype(sessions) tmp;
+				sessions.swap (tmp);
+			}
 			// drop not sent delayed messages
-			for (auto& it: delayedMessages)
-				it->Drop ();
+			if (!delayedMessages.empty ())
+			{
+				for (auto& it: delayedMessages)
+					it->Drop ();
+				decltype(delayedMessages) tmp;
+				delayedMessages.swap (tmp);
+			}
 		}
 
 		void SetRouter (std::shared_ptr<const i2p::data::RouterInfo> r)
@@ -176,7 +185,7 @@ namespace transport
 			uint32_t GetTransitBandwidth15s () const { return m_TransitBandwidth15s; };
 			int GetCongestionLevel (bool longTerm) const;
 			size_t GetNumPeers () const { return m_Peers.size (); };
-			std::shared_ptr<const i2p::data::RouterInfo> GetRandomPeer (bool isHighBandwidth) const;
+			std::shared_ptr<const i2p::data::RouterInfo> GetRandomPeer (bool isHighBandwidth, i2p::data::PeerOrdering * peerOrdering = nullptr) const;
 
 			/** get a trusted first hop for restricted routes */
 			std::shared_ptr<const i2p::data::RouterInfo> GetRestrictedPeer();
@@ -218,7 +227,7 @@ namespace transport
 			void DetectExternalIP ();
 
 			template<typename Filter>
-				std::shared_ptr<const i2p::data::RouterInfo> GetRandomPeer (Filter filter) const;
+				std::shared_ptr<const i2p::data::RouterInfo> GetRandomPeer (Filter filter, i2p::data::PeerOrdering * peerOrdering) const;
 			boost::asio::ip::address GetNetworkAddress (std::shared_ptr<TransportSession> session) const;
 			boost::asio::ip::address GetNetworkAddress (const boost::asio::ip::address& addr) const;
 

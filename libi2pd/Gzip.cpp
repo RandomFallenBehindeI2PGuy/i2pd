@@ -1,14 +1,12 @@
 /*
-* Copyright (c) 2013-2022, The PurpleI2P Project
+* Copyright (c) 2013-2026, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
 * See full license text in LICENSE file at top of project tree
 */
 
-#include <inttypes.h>
 #include <string.h> /* memset */
-#include <iostream>
 #include "Log.h"
 #include "I2PEndian.h"
 #include "Gzip.h"
@@ -17,7 +15,7 @@ namespace i2p
 {
 namespace data
 {
-	const size_t GZIP_CHUNK_SIZE = 16384;
+	constexpr size_t GZIP_CHUNK_SIZE = 16384;
 
 	GzipInflator::GzipInflator (): m_IsDirty (false)
 	{
@@ -36,7 +34,7 @@ namespace data
 		if (in[10] == 0x01) // non compressed
 		{
 			size_t len = bufle16toh (in + 11);
-			if (len + 23 < inLen)
+			if (len + 23 > inLen)
 			{
 				LogPrint (eLogError, "Gzip: Incorrect length");
 				return 0;

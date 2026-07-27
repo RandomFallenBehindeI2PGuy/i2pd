@@ -86,7 +86,7 @@ namespace transport
 		m_Server (server), m_Address (addr), m_RemoteTransports (0), m_RemotePeerTestTransports (0),
 		m_RemoteVersion (0), m_DestConnID (0), m_SourceConnID (0), m_State (eSSU2SessionStateUnknown),
 		m_SendPacketNum (0), m_ReceivePacketNum (0), m_LastDatetimeSentPacketNum (0),
-		m_IsDataReceived (false), m_RTT (SSU2_UNKNOWN_RTT),
+		m_IsDataReceived (false), m_IsInvalidMessage (false), m_RTT (SSU2_UNKNOWN_RTT),
 		m_MsgLocalExpirationTimeout (I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_MAX),
 		m_MsgLocalSemiExpirationTimeout (I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_MAX / 2),
 		m_WindowSize (SSU2_MIN_WINDOW_SIZE),
@@ -1428,6 +1428,14 @@ namespace transport
 
 		// handle other blocks
 		HandlePayload (decryptedPayload.data () + riSize + 3, decryptedPayload.size () - riSize - 3);
+		if (m_IsInvalidMessage)
+		{
+			LogPrint (eLogError, "SSU2: Invalid block in SessionConfirmed from ",
+				i2p::data::GetIdentHashAbbreviation (ri->GetIdentHash ()));
+			if (m_Address->published)
+				i2p::transport::transports.AddBan (m_RemoteEndpoint.address ());
+			return false;
+		}
 
 		Established ();
 		if (ri->GetCongestion () == i2p::data::RouterInfo::eRejectAll)
@@ -1784,6 +1792,12 @@ namespace transport
 				{
 					LogPrint (eLogDebug, "SSU2: I2NP message");
 					auto nextMsg = (buf[offset] == eI2NPTunnelData) ? NewI2NPTunnelMessage (true) : NewI2NPShortMessage ();
+					if (nextMsg->offset + size + 7 > nextMsg->maxLen) // 7 more bytes for full I2NP header
+					{
+						LogPrint (eLogWarning, "SSU2: I2NP message block size ", size, " exceeds max message size ", nextMsg->maxLen);
+						m_IsInvalidMessage = true;
+						break;
+					}
 					nextMsg->len = nextMsg->offset + size + 7; // 7 more bytes for full I2NP header
 					memcpy (nextMsg->GetNTCP2Header (), buf + offset, size);
 					nextMsg->FromNTCP2 (); // SSU2 has the same format as NTCP2
@@ -2004,7 +2018,7 @@ namespace transport
 			if (*ranges > lastPacketNum) break;
 			lastPacketNum -= *ranges; ranges++; // nacks
 			if (*ranges > lastPacketNum + 1) break;
-			firstPacketNum = lastPacketNum - *ranges + 1; ranges++; // acks
+			firstPacketNum = lastPacketNum + 1 - *ranges; ranges++; // acks
 			len -= 2;
 			HandleAckRange (firstPacketNum, lastPacketNum, 0);
 		}
@@ -2119,6 +2133,12 @@ namespace transport
 	void SSU2Session::HandleFirstFragment (const uint8_t * buf, size_t len)
 	{
 		auto msg = (buf[0] == eI2NPTunnelData) ? NewI2NPTunnelMessage (true) : NewI2NPShortMessage ();
+		if (msg->offset + len + 7 > msg->maxLen)
+		{
+			LogPrint (eLogWarning, "SSU2: First fragment size ", len, " exceeds max message size ", msg->maxLen);
+			m_IsInvalidMessage = true;
+			return;
+		}
 		uint32_t msgID; memcpy (&msgID, buf + 1, 4);
 		// same format as I2NP message block
 		msg->len = msg->offset + len + 7;
@@ -2151,6 +2171,12 @@ namespace transport
 	void SSU2Session::HandleFollowOnFragment (const uint8_t * buf, size_t len)
 	{
 		if (len < 5) return;
+		if (len - 5 > SSU2_MAX_PACKET_SIZE)
+		{
+			LogPrint (eLogWarning, "SSU2: Follow-on fragment size ", len, " exceeds max packet size");
+			m_IsInvalidMessage = true;
+			return;
+		}
 		uint8_t fragmentNum = buf[0] >> 1;
 		if (!fragmentNum || fragmentNum >= SSU2_MAX_NUM_FRAGMENTS)
 		{
@@ -2194,13 +2220,8 @@ namespace transport
 			msg->nextFragmentNum = 0;
 			it = m_IncompleteMessages.emplace (msgID, msg).first;
 		}
-		// insert out of sequence fragment
-		auto fragment = m_Server.GetFragmentsPool ().AcquireShared ();
-		memcpy (fragment->buf, buf + 5, len -5);
-		fragment->len = len - 5;
-		fragment->fragmentNum = fragmentNum;
-		fragment->isLast = isLast;
-		it->second->AddOutOfSequenceFragment (fragment);
+		// insert new out of sequence fragment
+		it->second->AddOutOfSequenceFragment(m_Server.GetFragmentsPool ().AcquireShared (buf + 5, len - 5, fragmentNum, isLast));
 	}
 
 	void SSU2Session::HandleRelayRequest (const uint8_t * buf, size_t len)
@@ -2733,9 +2754,9 @@ namespace transport
 	{
 		if (!msg) return;
 		uint32_t msgID = msg->GetMsgID ();
-		if (!msg->IsExpired ())
+		// m_LastActivityTimestamp is updated in ProcessData before
+		if (!msg->IsExpired (GetLastActivityTimestamp ()*1000LL)) // to milliseconds
 		{
-			// m_LastActivityTimestamp is updated in ProcessData before
 			if (m_ReceivedI2NPMsgIDs.emplace (msgID, (uint32_t)GetLastActivityTimestamp ()).second)
 				m_Handler.PutNextMessage (std::move (msg));
 			else

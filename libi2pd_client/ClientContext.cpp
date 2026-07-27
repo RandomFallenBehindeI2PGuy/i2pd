@@ -27,15 +27,12 @@ namespace client
 	ClientContext context;
 
 	ClientContext::ClientContext (): m_SharedLocalDestination (nullptr),
-		m_HttpProxy (nullptr), m_SocksProxy (nullptr), m_SamBridge (nullptr),
-		m_BOBCommandChannel (nullptr), m_I2CPServer (nullptr)
+		m_SamBridge (nullptr), m_BOBCommandChannel (nullptr), m_I2CPServer (nullptr)
 	{
 	}
 
 	ClientContext::~ClientContext ()
 	{
-		delete m_HttpProxy;
-		delete m_SocksProxy;
 		delete m_SamBridge;
 		delete m_BOBCommandChannel;
 		delete m_I2CPServer;
@@ -134,7 +131,6 @@ namespace client
 		{
 			LogPrint(eLogInfo, "Clients: Stopping HTTP Proxy");
 			m_HttpProxy->Stop();
-			delete m_HttpProxy;
 			m_HttpProxy = nullptr;
 		}
 
@@ -142,7 +138,6 @@ namespace client
 		{
 			LogPrint(eLogInfo, "Clients: Stopping SOCKS Proxy");
 			m_SocksProxy->Stop();
-			delete m_SocksProxy;
 			m_SocksProxy = nullptr;
 		}
 
@@ -229,7 +224,6 @@ namespace client
 		if (m_HttpProxy)
 		{
 			m_HttpProxy->Stop ();
-			delete m_HttpProxy;
 			m_HttpProxy = nullptr;
 		}
 		ReadHttpProxy ();
@@ -238,7 +232,6 @@ namespace client
 		if (m_SocksProxy)
 		{
 			m_SocksProxy->Stop ();
-			delete m_SocksProxy;
 			m_SocksProxy = nullptr;
 		}
 		ReadSocksProxy ();
@@ -410,6 +403,8 @@ namespace client
 		if (it != m_Destinations.end ())
 		{
 			LogPrint (eLogWarning, "Clients: Local destination ", m_AddressBook.ToAddress(keys.GetPublic ()->GetIdentHash ()), " exists");
+			if (keys.IsOfflineSignature ())
+				it->second->UpdateOfflineSignature (keys);
 			it->second->Start (); // make sure to start
 			return it->second;
 		}
@@ -425,6 +420,8 @@ namespace client
 		if (it != m_Destinations.end ())
 		{
 			LogPrint (eLogWarning, "Clients: Local destination ", m_AddressBook.ToAddress(keys.GetPublic ()->GetIdentHash ()), " exists");
+			if (keys.IsOfflineSignature ())
+				it->second->UpdateOfflineSignature (keys);
 			it->second->Start (); // make sure to start
 			return it->second;
 		}
@@ -521,6 +518,10 @@ namespace client
 		if (trustedRouters.length () > 0) options.Insert (I2CP_PARAM_TRUSTED_ROUTERS, trustedRouters);
 		std::string ratchetInboundTags = GetI2CPStringOption(section, I2CP_PARAM_RATCHET_INBOUND_TAGS, "");
 		if (ratchetInboundTags.length () > 0) options.Insert (I2CP_PARAM_RATCHET_INBOUND_TAGS, ratchetInboundTags);
+		std::string inboundRandomKey = GetI2CPStringOption(section, I2CP_PARAM_INBOUND_RANDOM_KEY, "");
+		if (inboundRandomKey.length () > 0) options.Insert (I2CP_PARAM_INBOUND_RANDOM_KEY, inboundRandomKey);
+		std::string outboundRandomKey = GetI2CPStringOption(section, I2CP_PARAM_OUTBOUND_RANDOM_KEY, "");
+		if (outboundRandomKey.length () > 0) options.Insert (I2CP_PARAM_OUTBOUND_RANDOM_KEY, outboundRandomKey);
 	}
 
 	void ClientContext::ReadI2CPOptionsFromConfig (const std::string& prefix, i2p::util::Mapping& options) const
@@ -678,6 +679,13 @@ namespace client
 						int datagramVersion = (i2p::datagram::DatagramVersion)section.second.get (UDP_CLIENT_TUNNEL_DATAGRAM_VERSION, (int)i2p::datagram::eDatagramV3);
 						auto clientTunnel = std::make_shared<I2PUDPClientTunnel> (name, dest, end,
 							localDestination, destinationPort, gzip, (i2p::datagram::DatagramVersion)datagramVersion);
+
+						uint32_t keepAlive = section.second.get<uint32_t>(I2P_CLIENT_TUNNEL_KEEP_ALIVE_INTERVAL, 0);
+						if (keepAlive)
+						{
+							clientTunnel->SetKeepAliveInterval (keepAlive);
+							LogPrint(eLogInfo, "Clients: UDP Client tunnel keep alive interval set to ", keepAlive);
+						}
 
 						auto ins = m_ClientForwards.insert (std::make_pair (end, clientTunnel));
 						if (ins.second)
@@ -963,10 +971,7 @@ namespace client
 			if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 			LogPrint(eLogInfo, "Clients: Starting HTTP Proxy at ", httpProxyAddr, ":", httpProxyPort);
 			if (httpProxyKeys == "shareddest")
-			{
 				localDestination = m_SharedLocalDestination;
-				localDestination->Acquire ();
-			}
 			else if (httpProxyKeys.length () > 0)
 			{
 				i2p::data::PrivateKeys keys;
@@ -976,14 +981,13 @@ namespace client
 					ReadI2CPOptionsFromConfig ("httpproxy.", params);
 					params.Insert (I2CP_PARAM_OUTBOUND_NICKNAME, "HTTPProxy");
 					localDestination = CreateNewLocalDestination (keys, false, &params);
-					if (localDestination) localDestination->Acquire ();
 				}
 				else
 					LogPrint(eLogCritical, "Clients: Failed to load HTTP Proxy key");
 			}
 			try
 			{
-				m_HttpProxy = new i2p::proxy::HTTPProxy("HTTP Proxy", httpProxyAddr, httpProxyPort,
+				m_HttpProxy = std::make_shared<i2p::proxy::HTTPProxy>("HTTP Proxy", httpProxyAddr, httpProxyPort,
 					httpOutProxyURL, httpAddresshelper, httpSendUserAgent, localDestination);
 				uint64_t closeIdleTime; i2p::config::GetOption("httpproxy.i2cp.closeIdleTime", closeIdleTime);
 				if (closeIdleTime)
@@ -1020,15 +1024,9 @@ namespace client
 			if (sigType > i2p::data::SIGNING_KEY_TYPE_REDDSA_SHA512_ED25519) sigType = i2p::data::SIGNING_KEY_TYPE_EDDSA_SHA512_ED25519;
 			LogPrint(eLogInfo, "Clients: Starting SOCKS Proxy at ", socksProxyAddr, ":", socksProxyPort);
 			if (socksProxyKeys == "shareddest")
-			{
 				localDestination = m_SharedLocalDestination;
-				localDestination->Acquire ();
-			}
 			else if (httpProxyKeys == socksProxyKeys && m_HttpProxy)
-			{
 				localDestination = m_HttpProxy->GetLocalDestination ();
-				localDestination->Acquire ();
-			}
 			else if (socksProxyKeys.length () > 0)
 			{
 				i2p::data::PrivateKeys keys;
@@ -1038,14 +1036,13 @@ namespace client
 					ReadI2CPOptionsFromConfig ("socksproxy.", params);
 					params.Insert (I2CP_PARAM_OUTBOUND_NICKNAME, "SOCKSProxy");
 					localDestination = CreateNewLocalDestination (keys, false, &params);
-					if (localDestination) localDestination->Acquire ();
 				}
 				else
 					LogPrint(eLogCritical, "Clients: Failed to load SOCKS Proxy key");
 			}
 			try
 			{
-				m_SocksProxy = new i2p::proxy::SOCKSProxy("SOCKS", socksProxyAddr, socksProxyPort,
+				m_SocksProxy = std::make_shared<i2p::proxy::SOCKSProxy>("SOCKS", socksProxyAddr, socksProxyPort,
 					socksOutProxy, socksOutProxyAddr, socksOutProxyPort, localDestination);
 				uint64_t closeIdleTime; i2p::config::GetOption("socksproxy.i2cp.closeIdleTime", closeIdleTime);
 				if (closeIdleTime)

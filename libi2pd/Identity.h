@@ -17,6 +17,7 @@
 #include <vector>
 #include "Base.h"
 #include "Signature.h"
+#include "Tag.h"
 
 namespace i2p
 {
@@ -190,6 +191,7 @@ namespace data
 			// offline keys
 			PrivateKeys CreateOfflineKeys (SigningKeyType type, uint32_t expires) const;
 			const std::vector<uint8_t>& GetOfflineSignature () const { return m_OfflineSignature; };
+			void UpdateOfflineSignature (const PrivateKeys& other); // refresh transient material, keep identity
 
 		private:
 
@@ -207,23 +209,6 @@ namespace data
 			size_t m_TransientSignatureLen = 0;
 			size_t m_TransientSigningPrivateKeyLen = 0;
 	};
-
-	// kademlia
-	struct XORMetric
-	{
-		union
-		{
-			uint8_t metric[32];
-			uint64_t metric_ll[4];
-		};
-
-		void SetMin () { memset (metric, 0, 32); };
-		void SetMax () { memset (metric, 0xFF, 32); };
-		bool operator< (const XORMetric& other) const { return memcmp (metric, other.metric, 32) < 0; };
-	};
-
-	IdentHash CreateRoutingKey (const IdentHash& ident, bool nextDay = false);
-	XORMetric operator^(const IdentHash& key1, const IdentHash& key2);
 
 	// destination for delivery instructions
 	class RoutingDestination

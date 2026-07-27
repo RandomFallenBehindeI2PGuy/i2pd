@@ -65,7 +65,8 @@ namespace client
 	const int DEFAULT_OUTBOUND_TUNNELS_LENGTH_VARIANCE = 0;
 	const char I2CP_PARAM_EXPLICIT_PEERS[] = "explicitPeers";
 	const char I2CP_PARAM_TRUSTED_ROUTERS[] = "trustedRouters";
-	const int STREAM_REQUEST_TIMEOUT = 60; //in seconds
+	const char I2CP_PARAM_INBOUND_RANDOM_KEY[] = "inbound.randomKey";
+	const char I2CP_PARAM_OUTBOUND_RANDOM_KEY[] = "outbound.randomKey";
 	const char I2CP_PARAM_TAGS_TO_SEND[] = "crypto.tagsToSend";
 	const int DEFAULT_TAGS_TO_SEND = 40;
 	const char I2CP_PARAM_RATCHET_INBOUND_TAGS[] = "crypto.ratchet.inboundTags";
@@ -185,10 +186,10 @@ namespace client
 			// I2CP
 			virtual void HandleDataMessage (const uint8_t * buf, size_t len, i2p::garlic::ECIESX25519AEADRatchetSession * from) = 0;
 			virtual void CreateNewLeaseSet (const std::vector<std::shared_ptr<i2p::tunnel::InboundTunnel> >& tunnels) = 0;
+			void UpdateLeaseSet ();
 
 		private:
 
-			void UpdateLeaseSet ();
 			std::shared_ptr<const i2p::data::LocalLeaseSet> GetLeaseSetMt ();
 			void Publish ();
 			void HandlePublishConfirmationTimer (const boost::system::error_code& ecode);
@@ -251,6 +252,7 @@ namespace client
 
 			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };
 			void SetPrivateKeys (const i2p::data::PrivateKeys& keys);
+			void UpdateOfflineSignature (const i2p::data::PrivateKeys& keys);
 			void Sign (const uint8_t * buf, int len, uint8_t * signature) const { m_Keys.Sign (buf, len, signature); };
 
 			// ref counter
@@ -285,8 +287,8 @@ namespace client
             int GetStreamingMaxResends () const { return m_StreamingMaxResends; }
 
 			// datagram
-			i2p::datagram::DatagramDestination * GetDatagramDestination () const { return m_DatagramDestination; };
-			i2p::datagram::DatagramDestination * CreateDatagramDestination (bool gzip = true,
+			std::shared_ptr<i2p::datagram::DatagramDestination> GetDatagramDestination () const { return m_DatagramDestination; };
+			std::shared_ptr<i2p::datagram::DatagramDestination> CreateDatagramDestination (bool gzip = true,
 				i2p::datagram::DatagramVersion version = i2p::datagram::eDatagramV1);
 
 			// implements LocalDestination
@@ -330,7 +332,7 @@ namespace client
 			std::shared_ptr<i2p::stream::StreamingDestination> m_StreamingDestination; // default
 			std::map<uint16_t, std::shared_ptr<i2p::stream::StreamingDestination> > m_StreamingDestinationsByPorts;
 			std::shared_ptr<i2p::stream::StreamingDestination> m_LastStreamingDestination; uint16_t m_LastPort; // for server tunnels
-			i2p::datagram::DatagramDestination * m_DatagramDestination;
+			std::shared_ptr<i2p::datagram::DatagramDestination> m_DatagramDestination;
 			int m_RefCounter; // how many clients(tunnels) use this destination
 			uint64_t m_LastPublishedTimestamp;
 

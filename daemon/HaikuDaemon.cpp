@@ -12,12 +12,19 @@
 #include <string>
 #include <MenuItem.h>
 #include <MenuBar.h>
-#include <StringView.h>
+#include <TextView.h>
 #include <Font.h>
 #include <MessageRunner.h>
+#include <StringItem.h>
+#include <ListView.h>
+#include <TabView.h>
+#include <ScrollView.h>
+#include <Button.h>
 #include <Window.h>
 #include <Application.h>
 #include <Alert.h>
+#include<sstream>
+//#include<Roster.h>
 
 #include "version.h"
 #include "Log.h"
@@ -27,14 +34,17 @@
 #include "Transports.h"
 #include "Daemon.h"
 #include "ClientContext.h"
-
 enum
 {
 	M_GRACEFUL_SHUTDOWN = 1,
 	M_RUN_PEER_TEST,
 	M_DUMMY_COMMAND,
 	C_GRACEFUL_SHUTDOWN_UPDATE,
-	C_MAIN_VIEW_UPDATE
+	C_MAIN_VIEW_UPDATE,
+	M_SHOW_TUNNEL,
+	C_OPENHTTP,
+	M_SHOWMAIN,
+        M_CLOSETUNNEL
 };	
 constexpr bigtime_t GRACEFUL_SHUTDOWN_UPDATE_INTERVAL = 1000*1100; // in microseconds, ~ 1 sec
 constexpr int GRACEFUL_SHUTDOWN_UPDATE_COUNT = 600; // 10 minutes
@@ -48,14 +58,19 @@ class MainWindow: public BWindow
 	private:
 		void MessageReceived (BMessage * msg) override;	
 		bool QuitRequested () override;
-	
+		void GetInfoAboutTunnel(BMessage * msg);	
 		void UpdateMainView ();
-	
+		void OpenHTTPInterface(void);
+		void DrawTunnel(std::stringstream & s);
+		size_t m_counter_streams = 0;
 	private:
 		BMessenger m_Messenger;
-		BStringView * m_MainView;
+		BTabView * m_tab_view;
+		BTextView * m_MainView;
 		std::unique_ptr<BMessageRunner> m_MainViewUpdateTimer, m_GracefulShutdownTimer;	
 		bool m_IsGracefulShutdownComplete = false;
+		bool m_IsDrawTunnel = false;
+		i2p::data::IdentHash m_IdentHash;
 };	
 
 class I2PApp: public BApplication
@@ -74,7 +89,9 @@ MainWindow::MainWindow ():
 	auto menuBar = new BMenuBar (r, "menubar");
 	AddChild (menuBar);
 	auto runMenu = new BMenu ("Run");
+	runMenu->AddItem (new BMenuItem ("Open web interface", new BMessage(C_OPENHTTP)));
 	runMenu->AddItem (new BMenuItem ("Graceful shutdown", new BMessage (M_GRACEFUL_SHUTDOWN), 'G'));
+	runMenu->AddItem (new BMenuItem ("Show Main page", new BMessage (M_SHOWMAIN), 'M'));
 	runMenu->AddItem (new BMenuItem ("Quit", new BMessage (B_QUIT_REQUESTED), 'Q'));
 	menuBar->AddItem (runMenu);
 	auto commandsMenu = new BMenu ("Commands");
@@ -82,36 +99,222 @@ MainWindow::MainWindow ():
 	menuBar->AddItem (commandsMenu);
 	auto tunnelsMenu = new BMenu ("Tunnels");
 	for (auto& it: i2p::client::context.GetClientTunnels ())
-		tunnelsMenu->AddItem (new BMenuItem (it.second->GetName (), new BMessage (M_DUMMY_COMMAND)));
+	{
+		auto msg = new BMessage{M_SHOW_TUNNEL};
+		msg->AddString("tunnel_name", BString(it.second->GetName()));
+		msg->AddBool("is_client_tunnel", true);
+		tunnelsMenu->AddItem (new BMenuItem (it.second->GetName (), msg));
+	}
 	for (auto& it: i2p::client::context.GetServerTunnels ())
-		tunnelsMenu->AddItem (new BMenuItem (it.second->GetName (), new BMessage (M_DUMMY_COMMAND)));	
+	{
+		auto msg = new BMessage{M_SHOW_TUNNEL};
+		msg->AddString("tunnel_name", BString(it.second->GetName()));
+		msg->AddBool("is_client_tunnel", false);
+		tunnelsMenu->AddItem (new BMenuItem (it.second->GetName (), msg));	
+	}
 	menuBar->AddItem (tunnelsMenu);
-	m_MainView = new BStringView (BRect (20, 21, 300, 250), nullptr, "Starting...", B_FOLLOW_ALL, B_WILL_DRAW);
-	m_MainView->SetViewColor (255, 255, 255);
-	m_MainView->SetHighColor (0xD4, 0x3B, 0x69);
+
+	m_tab_view = new BTabView(Bounds().OffsetByCopy(0, 20), "tabview");
+	AddChild(m_tab_view);
+
+	BRect tabRect = m_tab_view->ContainerView()->Bounds();
+	auto bview = new BView(tabRect, "main_tab", B_FOLLOW_ALL, B_WILL_DRAW);
+	bview->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+
+	BRect viewRect(10, 10, tabRect.right - 10, tabRect.bottom - 20);
+	m_MainView = new BTextView(viewRect,"info_view", viewRect, B_FOLLOW_ALL);
+	m_MainView->MakeEditable (false);
+	m_MainView->MakeSelectable (true);
 	BFont font = *be_plain_font;
 	font.SetSize (12);
-	m_MainView->SetFont (&font);	
-	AddChild (m_MainView);
+	rgb_color color;
+	color.set_to (0xD4, 0x3B, 0x69);
+	m_MainView->SetFontAndColor (&font, B_FONT_ALL, &color);
+	m_MainView->SetText ("Starting...");
+	bview->AddChild(m_MainView);
+
+	m_tab_view->AddTab(bview);
+	m_tab_view->TabAt(m_counter_streams)->SetLabel("Info");
+		
 	m_MainViewUpdateTimer = std::make_unique<BMessageRunner>(m_Messenger, 
 		BMessage (C_MAIN_VIEW_UPDATE), MAIN_VIEW_UPDATE_INTERVAL);
-}	
+}
 
 void MainWindow::UpdateMainView ()
 {
 	std::stringstream s;
-	i2p::util::PrintMainWindowText (s);
+	if(!m_IsDrawTunnel)
+	{
+	 i2p::util::PrintMainWindowText (s);
+	}
+	else 
+	{
+	  DrawTunnel(s);
+        }
+	////std::cout << s.str() << std::endl;
 	m_MainView->SetText (s.str ().c_str ());
 }	
+/*
+ * Логика - создать вектор с streamID + vector dest.
+ * не перерисовывать каждый раз а лишь добавлять которых нет 
+ * и удалять те которые есть
+ * кнопка close работает
+ * */
+void MainWindow :: DrawTunnel(std::stringstream & s)
+{
+       
+	s << "\n";
+	s << "I2P Address: " << i2p::client::context.GetAddressBook().ToAddress(m_IdentHash) << "\n";
+	auto dest = i2p::client::context.FindLocalDestination (m_IdentHash);
+	while(m_tab_view->CountTabs() > 1)
+	{
+		m_tab_view->RemoveTab(m_tab_view->CountTabs() - 1);
+	}
+	m_counter_streams = 0;
+	//std::cout << "Draw List View" << std::endl;;
+	if(!dest)
+	{
+		s << "Can't found local dest\r\n";
+	}
+	else
+	{
+		if (dest->IsEncryptedLeaseSet ())
+		{
+			i2p::data::BlindedPublicKey blinded (dest->GetIdentity (), dest->IsPerClientAuth ());
+			s << "B33 address: " << blinded.ToB33 () << ".b32.i2p\n";
+		}	
+		s << "Streams: \n";
+		for (auto stream : dest->GetAllStreams())
+		{
+			std::stringstream s1;
+			auto streamDest = i2p::client::context.GetAddressBook().ToAddress(stream->GetRemoteIdentity());
+			std::string streamDestShort = streamDest.substr(0,12) + ".b32.i2p";
+			s1 << streamDestShort << "|out|" << stream->GetNumSentBytes() << "|in:" << stream->GetNumReceivedBytes() <<"|";
+
+			BRect tabRect = m_tab_view->ContainerView()->Bounds();
+			auto bview = new BView(tabRect, streamDestShort.c_str(), B_FOLLOW_ALL, B_WILL_DRAW);
+			bview->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+
+			BRect viewRect(0, 0, tabRect.right - 100, tabRect.bottom - 100);
+			auto tunnel_view = new BTextView(viewRect,"tunnel_view", viewRect, B_FOLLOW_ALL);
+			tunnel_view->MakeEditable (false);
+			tunnel_view->MakeSelectable (true);
+			tunnel_view->SetText (s1.str ().c_str ());
+			
+			BRect btnRect{10,10,90,35};//10+32,10+12);
+			auto msg = new BMessage(M_CLOSETUNNEL);
+			msg->AddUInt32("tunnel_val", stream->GetRecvStreamID());
+			BButton * closeButton = new BButton(
+			btnRect,"close leaseset", "close", msg
+					);
+			bview->AddChild(closeButton);
+			bview->AddChild(tunnel_view);
+
+			
+			m_tab_view->AddTab(bview);
+			m_tab_view->TabAt(++m_counter_streams)->SetLabel(streamDestShort.c_str());
+
+
+			/*
+			 * void ShowLocalDestination in daemon/HTTPServer.cpp
+			 */
+			s << s1.str() << "\n";
+		}
+		//s << "\r\n";
+	}
+}
+
+void MainWindow :: GetInfoAboutTunnel(BMessage * msg)
+{
+	if(!msg) return;
+	bool isClient = false;
+	BString name{};
+	msg->FindString("tunnel_name", &name);
+	msg->FindBool("is_client_tunnel", &isClient);
+	if (isClient)
+	{
+		 for(auto it :i2p::client::context.GetClientTunnels () )
+		 {
+			if( BString(it.second->GetName()) == name )
+			{
+	     		  auto & ident = it.second->GetLocalDestination()->GetIdentHash();
+			  m_IdentHash = ident;
+			  m_IsDrawTunnel = true;
+			  return UpdateMainView(); 
+					   //TODO:
+			}
+		 }
+	}else {
+		for(auto it: i2p::client::context.GetServerTunnels())
+		{
+			if( BString(it.second->GetName()) == name)
+			{
+	     		  auto & ident = it.second->GetLocalDestination()->GetIdentHash();
+			  m_IdentHash = ident;
+			  m_IsDrawTunnel = true;
+			  return UpdateMainView();
+						//TODO:
+			}
+		}	
+	}// if not client tunnel
+}
+
+void MainWindow :: OpenHTTPInterface()
+{
+	bool enabled; i2p::config::GetOption("http.enabled", enabled);
+	uint16_t port; i2p::config::GetOption("http.port", port);
+	std::string address; i2p::config::GetOption("http.address", address);
+	if(!enabled)
+	{
+		return m_MainView->SetText("Not enabled http server");
+	}
+	std::ostringstream com;
+	com << "/bin/open 'http://" << address << ":" << port<<"'";
+	//char * argv[] = {(char*)url.str().c_str() , NULL, NULL};
+	//BRoster{}.Launch( "application/x-vnd.Haiku-WebPositive", 2, argv);
+	std::string com_s{com.str()};
+	std::thread ([com_s]() {
+		system(com_s.c_str());
+	}).detach();	
+}
 
 void MainWindow::MessageReceived (BMessage * msg)
 {
 	if (!msg) return;
+	uint32_t tunnel_val;// streamID (to method)
 	switch (msg->what)
 	{
+		// to method
+                   case M_CLOSETUNNEL:
+                       //std::cout << "Close Tunnel (DEBUG NOT WORKS)" << std::endl;
+		       msg->FindUInt32("tunnel_val", &tunnel_val);
+		       if(tunnel_val)
+		       {
+				auto dest = 
+				i2p::client::context.FindLocalDestination
+				(m_IdentHash);
+				if(dest)
+				{
+					dest->DeleteStream(tunnel_val);
+				}
+		       }
+
+                  break;
+		case M_SHOWMAIN:
+			m_IsDrawTunnel = false;
+			m_IdentHash = {};
+			UpdateMainView();
+		break;
 		case C_MAIN_VIEW_UPDATE:
 			UpdateMainView ();
 		break;
+		case C_OPENHTTP:
+			OpenHTTPInterface();
+
+		break;
+		case M_SHOW_TUNNEL:
+				GetInfoAboutTunnel(msg);
+				break;
 		case M_GRACEFUL_SHUTDOWN:
 			if (!m_GracefulShutdownTimer)
 			{

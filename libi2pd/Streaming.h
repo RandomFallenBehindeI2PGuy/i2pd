@@ -234,7 +234,7 @@ namespace stream
 			void SendQuickAck ();
 			void SendClose ();
 			bool SendPacket (Packet * packet);
-			void SendPackets (const std::vector<Packet *>& packets);
+			void SendPackets (const std::list<Packet *>& packets);
 			void SendUpdatedLeaseSet ();
 
 			void SavePacket (Packet * packet);
@@ -285,8 +285,8 @@ namespace stream
 			std::shared_ptr<i2p::tunnel::OutboundTunnel> m_CurrentOutboundTunnel;
 			std::queue<Packet *> m_ReceiveQueue;
 			std::set<Packet *, PacketCmp> m_SavedPackets;
-			std::set<Packet *, PacketCmp> m_SentPackets;
-			std::set<Packet *, PacketCmp> m_NACKedPackets;
+			std::list<Packet *> m_SentPackets;
+			std::list<Packet *> m_NACKedPackets;
 			boost::asio::steady_timer m_ReceiveTimer, m_SendTimer, m_ResendTimer, m_AckSendTimer;
 			size_t m_NumSentBytes, m_NumReceivedBytes;
 			uint16_t m_Port;

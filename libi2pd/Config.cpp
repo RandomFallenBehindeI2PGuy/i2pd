@@ -271,14 +271,15 @@ namespace config {
 				"https://reseed.onion.im/,"
 				"https://i2pseed.creativecowpat.net:8443/,"
 				"https://reseed.i2pgit.org/,"
-				"https://coconut.incognet.io/,"
+				"https://coconut.incognet.io/," // expired cert
 				"https://reseed-pl.i2pd.xyz/,"
 				"https://www2.mk16.de/,"
 			    "https://i2p.novg.net/,"
             	"https://reseed.stormycloud.org/,"
             	"https://reseed.sahil.world/,"
             	"https://i2p.diyarciftci.xyz/,"
-            	"https://bybyh.de/"
+            	"https://bybyh.de/,"
+            	"https://spiral.likogan.dev/"
 			),                                                            "Reseed URLs, separated by comma")
 			("reseed.yggurls", value<std::string>()->default_value(
 				"http://[324:71e:281a:9ed3::ace]:7070/,"
@@ -332,9 +333,9 @@ namespace config {
 			("ntcp2.addressv6", value<std::string>()->default_value("::"), "Address to publish NTCP2 with")
 			("ntcp2.proxy", value<std::string>()->default_value(""),       "Proxy URL for NTCP2 transport")
 #if OPENSSL_PQ
-			("ntcp2.version", value<int>()->default_value(4),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 4")
+			("ntcp2.version", value<int>()->default_value(4),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 4)")
 #else
-			("ntcp2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 2")
+			("ntcp2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4,5 - post quantum (default: 2)")
 #endif
 		;
 
@@ -348,7 +349,11 @@ namespace config {
 			("ssu2.proxy", value<std::string>()->default_value(""),       "Socks5 proxy URL for SSU2 transport")
 			("ssu2.firewalled4", value<bool>()->default_value(false),     "Set ipv4 network status to Firewalled even if OK (default: disabled)")
 			("ssu2.firewalled6", value<bool>()->default_value(false),     "Set ipv6 network status to Firewalled even if OK (default: disabled)")
-			("ssu2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4 - post quantum (default: 2")
+#if OPENSSL_PQ
+			("ssu2.version", value<int>()->default_value(4),              "Protocol version. 2 - standard, 3,4 - post quantum (default: 4)")
+#else
+			("ssu2.version", value<int>()->default_value(2),              "Protocol version. 2 - standard, 3,4 - post quantum (default: 2)")
+#endif
 		;
 
 		options_description nettime("Time sync options");
@@ -391,6 +396,16 @@ namespace config {
 		;
 #endif
 
+#ifdef __OpenBSD__
+		options_description openbsd_specific("OpenBSD specific options");
+		openbsd_specific.add_options()
+			("openbsd.pledge_file", value<std::string>()->default_value(""), "OpenbSD file with pledge rules")
+			("openbsd.unevil_file", value<std::string>()->default_value(""), "OpenBSD file with unevil rules")
+			("openbsd.unevil_enabled", value<bool>()->default_value(true),     "use unevil rues")
+			("openbsd.pledge_enabled", value<bool>()->default_value(true),     "use pledge rules")
+			;
+#endif
+
 		m_OptionsDesc
 			.add(general)
 			.add(limits)
@@ -417,6 +432,9 @@ namespace config {
 			.add(meshnets)
 #ifdef __linux__
 			.add(unix_specific)
+#endif
+#ifdef __OpenBSD__
+			.add(openbsd_specific)
 #endif
 		;
 	}

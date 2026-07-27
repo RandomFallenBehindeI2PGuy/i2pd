@@ -643,6 +643,17 @@ namespace data
 		m_Signer->Sign (buf, len, signature);
 	}
 
+	void PrivateKeys::UpdateOfflineSignature (const PrivateKeys& other)
+	{
+		// same identity (m_Public): refresh only the transient material and the signer
+		m_SigningPrivateKey = other.m_SigningPrivateKey;
+		m_OfflineSignature = other.m_OfflineSignature;
+		m_TransientSignatureLen = other.m_TransientSignatureLen;
+		m_TransientSigningPrivateKeyLen = other.m_TransientSigningPrivateKeyLen;
+		m_Signer = nullptr;
+		CreateSigner ();
+	}
+
 	void PrivateKeys::CreateSigner () const
 	{
 		if (IsOfflineSignature ())
@@ -862,32 +873,6 @@ namespace data
 		// signing
 		i2p::crypto::CreateDSARandomKeys (keys.signingPrivateKey, keys.signingKey);
 		return keys;
-	}
-
-	IdentHash CreateRoutingKey (const IdentHash& ident, bool nextDay)
-	{
-		uint8_t buf[41]; // ident + yyyymmdd
-		memcpy (buf, (const uint8_t *)ident, 32);
-		if (nextDay)
-			i2p::util::GetNextDayDate ((char *)(buf + 32));
-		else
-			i2p::util::GetCurrentDate ((char *)(buf + 32));
-		IdentHash key;
-		SHA256(buf, 40, key);
-		return key;
-	}
-
-	XORMetric operator^(const IdentHash& key1, const IdentHash& key2)
-	{
-		XORMetric m;
-
-		const uint64_t * hash1 = key1.GetLL (), * hash2 = key2.GetLL ();
-		m.metric_ll[0] = hash1[0] ^ hash2[0];
-		m.metric_ll[1] = hash1[1] ^ hash2[1];
-		m.metric_ll[2] = hash1[2] ^ hash2[2];
-		m.metric_ll[3] = hash1[3] ^ hash2[3];
-
-		return m;
 	}
 }
 }

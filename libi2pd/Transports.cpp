@@ -23,33 +23,30 @@ namespace i2p
 {
 namespace transport
 {
-	template<typename Keys>
-	EphemeralKeysSupplier<Keys>::EphemeralKeysSupplier (int size):
+	X25519KeysPairSupplier::X25519KeysPairSupplier (int size):
 		m_QueueSize (size), m_IsRunning (false)
 	{
 	}
 
-	template<typename Keys>
-	EphemeralKeysSupplier<Keys>::~EphemeralKeysSupplier ()
+	X25519KeysPairSupplier::~X25519KeysPairSupplier ()
 	{
 		Stop ();
 	}
 
-	template<typename Keys>
-	void EphemeralKeysSupplier<Keys>::Start ()
+	void X25519KeysPairSupplier::Start ()
 	{
 		m_IsRunning = true;
-		m_Thread.reset (new std::thread (std::bind (&EphemeralKeysSupplier<Keys>::Run, this)));
+		m_Thread.reset (new std::thread (std::bind (&X25519KeysPairSupplier::Run, this)));
 	}
 
-	template<typename Keys>
-	void EphemeralKeysSupplier<Keys>::Stop ()
+	void X25519KeysPairSupplier::Stop ()
 	{
 		{
 			std::unique_lock<std::mutex> l(m_AcquiredMutex);
 			m_IsRunning = false;
-			m_Acquired.notify_one ();
 		}
+		m_Acquired.notify_one ();
+
 		if (m_Thread)
 		{
 			m_Thread->join ();
@@ -58,29 +55,36 @@ namespace transport
 		if (!m_Queue.empty ())
 		{
 			// clean up queue
-			std::queue<std::shared_ptr<Keys> > tmp;
+			std::list<std::shared_ptr<i2p::crypto::X25519Keys> > tmp;
 	   		std::swap (m_Queue, tmp);
 		}
 		m_KeysPool.CleanUpMt ();
 	}
 
-	template<typename Keys>
-	void EphemeralKeysSupplier<Keys>::Run ()
+	void X25519KeysPairSupplier::Run ()
 	{
 		i2p::util::SetThreadName("Ephemerals");
 
+		int num = 0;
 		while (m_IsRunning)
 		{
-			int num, total = 0;
-			while ((num = m_QueueSize - (int)m_Queue.size ()) > 0 && total < m_QueueSize)
+			if (num <= 0)
 			{
-				CreateEphemeralKeys (num);
+				std::unique_lock<std::mutex> l(m_AcquiredMutex);
+				num = m_QueueSize - (int)m_Queue.size ();
+			}
+			int total = 0;
+			while (num > 0 && total < m_QueueSize)
+			{
+				auto queueSize = CreateEphemeralKeys (num);
 				total += num;
+				num = m_QueueSize - (int)queueSize;
 			}
 			if (total > m_QueueSize)
 			{
 				LogPrint (eLogWarning, "Transports: ", total, " ephemeral keys generated at the time");
 				std::this_thread::sleep_for (std::chrono::seconds(1)); // take a break
+				num = 0;
 			}
 			else
 			{
@@ -88,52 +92,62 @@ namespace transport
 				std::unique_lock<std::mutex> l(m_AcquiredMutex);
 				if (!m_IsRunning) break;
 				m_Acquired.wait (l); // wait for element gets acquired
+				num = m_QueueSize - (int)m_Queue.size ();
 			}
 		}
 	}
 
-	template<typename Keys>
-	void EphemeralKeysSupplier<Keys>::CreateEphemeralKeys (int num)
+	size_t X25519KeysPairSupplier::CreateEphemeralKeys (int num)
 	{
 		if (num > 0)
 		{
+			std::list<std::shared_ptr<i2p::crypto::X25519Keys> > newKeys;
 			for (int i = 0; i < num; i++)
 			{
 				auto pair = m_KeysPool.AcquireSharedMt ();
 				pair->GenerateKeys ();
-				std::unique_lock<std::mutex> l(m_AcquiredMutex);
-				m_Queue.push (pair);
+				newKeys.emplace_back (pair);
 			}
+			std::unique_lock<std::mutex> l(m_AcquiredMutex);
+			m_Queue.splice (m_Queue.end (), newKeys);
+			return m_Queue.size ();
+		}
+		else
+		{
+			std::unique_lock<std::mutex> l(m_AcquiredMutex);
+			return m_Queue.size ();
 		}
 	}
 
-	template<typename Keys>
-	std::shared_ptr<Keys> EphemeralKeysSupplier<Keys>::Acquire ()
+	std::shared_ptr<i2p::crypto::X25519Keys> X25519KeysPairSupplier::Acquire ()
 	{
+		std::shared_ptr<i2p::crypto::X25519Keys> pair;
 		{
 			std::unique_lock<std::mutex> l(m_AcquiredMutex);
 			if (!m_Queue.empty ())
 			{
-				auto pair = m_Queue.front ();
-				m_Queue.pop ();
-				m_Acquired.notify_one ();
-				return pair;
+				pair = m_Queue.front ();
+				m_Queue.pop_front ();
 			}
 		}
+		if (pair)
+		{
+			m_Acquired.notify_one ();
+			return pair;
+		}
 		// queue is empty, create new
-		auto pair = m_KeysPool.AcquireSharedMt ();
+		pair = m_KeysPool.AcquireSharedMt ();
 		pair->GenerateKeys ();
 		return pair;
 	}
 
-	template<typename Keys>
-	void EphemeralKeysSupplier<Keys>::Return (std::shared_ptr<Keys> pair)
+	void X25519KeysPairSupplier::Return (std::shared_ptr<i2p::crypto::X25519Keys> pair)
 	{
 		if (pair)
 		{
 			std::unique_lock<std::mutex> l(m_AcquiredMutex);
 			if ((int)m_Queue.size () < 2*m_QueueSize)
-				m_Queue.push (pair);
+				m_Queue.emplace_back (pair);
 		}
 		else
 			LogPrint(eLogError, "Transports: Return null keys");
@@ -497,7 +511,14 @@ namespace transport
 			std::lock_guard<std::mutex> l(m_PeersMutex);
 			auto it = m_Peers.find (ident);
 			if (it != m_Peers.end ())
+			{
 				peer = it->second;
+				if (peer->isDone)
+				{
+					peer = nullptr;
+					m_Peers.erase (it);
+				}
+			}
 		}
 		if (!peer)
 		{
@@ -701,12 +722,32 @@ namespace transport
 		if (isReal)
 		{
 			ssu2 = m_Rng () & 1; // 1/2
-			if (ssu2 && !profile)
+			if (ssu2 && (compatibleTransports & (i2p::data::RouterInfo::eSSU2V4 | i2p::data::RouterInfo::eSSU2V6)))
 			{
-				profile = peer->router->GetProfile (); // load profile if necessary
-				isReal = profile->IsReal ();
-				if (!isReal) ssu2 = false; // try NTCP2 if router is not confirmed real
+				bool isSSU2PQ = false;
+#if OPENSSL_PQ
+				if (m_SSU2Server && m_SSU2Server->GetVersion () > 2)
+				{
+					isSSU2PQ = true;
+					// both ipv4 and ipv6 must be post-quantum if presented
+					auto addr = peer->router->GetSSU2V4Address ();
+					if (addr && addr->v == 2) isSSU2PQ = false;
+					if (isSSU2PQ)
+					{
+						auto addr = peer->router->GetSSU2V6Address ();
+						if (addr && addr->v == 2) isSSU2PQ = false;
+					}
+				}
+#endif
+				if (!isSSU2PQ && !profile) // check profile only if SSU2 is not post-quantum
+				{
+					profile = peer->router->GetProfile (); // load profile if necessary
+					isReal = profile->IsReal ();
+					if (!isReal) ssu2 = false; // try NTCP2 if router is not confirmed real
+				}
 			}
+			else
+				ssu2 = false;
 		}
 		const auto& priority = ssu2 ? ssu2Priority : ntcp2Priority;
 		if (directTransports)
@@ -1068,38 +1109,58 @@ namespace transport
 		if (ecode != boost::asio::error::operation_aborted)
 		{
 			auto ts = i2p::util::GetSecondsSinceEpoch ();
-			for (auto it = m_Peers.begin (); it != m_Peers.end (); )
+			std::list<std::shared_ptr<TransportSession> > sessionsToRemove;
+			std::list<std::shared_ptr<Peer> > peersToRemove;
+
 			{
-				it->second->sessions.remove_if (
-					[](std::shared_ptr<TransportSession> session)->bool
-					{
-						return !session || !session->IsEstablished ();
-					});
- 				if (!it->second->IsConnected () && ts > it->second->creationTime + SESSION_CREATION_TIMEOUT)
+				std::lock_guard<std::mutex> l(m_PeersMutex);
+				for (auto it = m_Peers.begin (); it != m_Peers.end (); )
 				{
-					LogPrint (eLogWarning, "Transports: Session to peer ", it->first.ToBase64 (), " has not been created in ", SESSION_CREATION_TIMEOUT, " seconds");
-				/*	if (!it->second.router)
+					auto peer = it->second;
+					peer->sessions.remove_if (
+						[&sessionsToRemove](std::shared_ptr<TransportSession> session)->bool
+						{
+							bool remove = false;
+							if (session)
+							{
+								if (!session->IsEstablished ())
+								{
+									sessionsToRemove.emplace_back (session); // defer session destructor call after the loop
+									remove = true;
+								}
+							}
+							else
+								remove = true;
+							return remove;
+						});
+					if (!peer->IsConnected () && ts > peer->creationTime + SESSION_CREATION_TIMEOUT)
 					{
-						// if router for ident not found mark it unreachable
-						auto profile = i2p::data::GetRouterProfile (it->first);
-						if (profile) profile->Unreachable ();
-					}	*/
-					std::lock_guard<std::mutex> l(m_PeersMutex);
-					it = m_Peers.erase (it);
-				}
-				else
-				{
-					if (ts > it->second->nextRouterInfoUpdateTime)
-					{
-						auto session = it->second->sessions.front ();
-						if (session)
-							session->SendLocalRouterInfo (true);
-						it->second->nextRouterInfoUpdateTime = ts + PEER_ROUTER_INFO_UPDATE_INTERVAL +
-							m_Rng() % PEER_ROUTER_INFO_UPDATE_INTERVAL_VARIANCE;
+						LogPrint (eLogWarning, "Transports: Session to peer ", it->first.ToBase64 (), " has not been created in ", SESSION_CREATION_TIMEOUT, " seconds");
+					/*	if (!it->second.router)
+						{
+							// if router for ident not found mark it unreachable
+							auto profile = i2p::data::GetRouterProfile (it->first);
+							if (profile) profile->Unreachable ();
+						}	*/
+						peer->isDone = true;
+						peersToRemove.emplace_back (peer); // defer peer destructor call after the loop
+						it = m_Peers.erase (it);
 					}
-					++it;
+					else
+					{
+						if (ts > peer->nextRouterInfoUpdateTime)
+						{
+							auto session = (!peer->sessions.empty ()) ? peer->sessions.front () : nullptr;
+							if (session)
+								session->SendLocalRouterInfo (true);
+							peer->nextRouterInfoUpdateTime = ts + PEER_ROUTER_INFO_UPDATE_INTERVAL +
+								m_Rng() % PEER_ROUTER_INFO_UPDATE_INTERVAL_VARIANCE;
+						}
+						++it;
+					}
 				}
 			}
+
 			bool ipv4Testing = i2p::context.GetTesting ();
 			if (!ipv4Testing)
 				ipv4Testing = i2p::context.GetRouterInfo ().IsSSU2V4 () && (i2p::context.GetStatus() == eRouterStatusUnknown);
@@ -1111,6 +1172,9 @@ namespace transport
 				PeerTest (ipv4Testing, ipv6Testing);
 			m_PeerCleanupTimer->expires_after (std::chrono::seconds(2 * SESSION_CREATION_TIMEOUT + m_Rng() % SESSION_CREATION_TIMEOUT));
 			m_PeerCleanupTimer->async_wait (std::bind (&Transports::HandlePeerCleanupTimer, this, std::placeholders::_1));
+			// cleanup and delete sessionsToRemove and peersToRemove here
+			for (auto& it: peersToRemove)
+				it->Done ();
 		}
 	}
 
@@ -1148,100 +1212,117 @@ namespace transport
 	}
 
 	template<typename Filter>
-	std::shared_ptr<const i2p::data::RouterInfo> Transports::GetRandomPeer (Filter filter) const
+	std::shared_ptr<const i2p::data::RouterInfo> Transports::GetRandomPeer (Filter filter, i2p::data::PeerOrdering * peerOrdering) const
 	{
-		if (m_Peers.empty()) return nullptr;
+		std::vector<std::pair<i2p::data::IdentHash, std::shared_ptr<Peer> > > peers;
+		{
+			// copy peers to temporary vector
+			std::lock_guard<std::mutex> l(m_PeersMutex);
+			if (m_Peers.empty()) return nullptr;
+			peers.reserve (m_Peers.size ());
+			peers.assign (m_Peers.begin(), m_Peers.end());
+		}
 		auto ts = i2p::util::GetSecondsSinceEpoch ();
 		bool found = false;
-		i2p::data::IdentHash ident;
+		i2p::data::IdentHash foundIdent;
+		uint16_t inds[3];
+		RAND_bytes ((uint8_t *)inds, sizeof (inds));
+		auto count = peers.size ();
+		if (!count) return nullptr;
+		inds[0] %= count;
+		auto& [ident, peer] = peers[inds[0]];
+		// try random peer
+		if (!peer->isDone && ts > peer->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL)
 		{
-			uint16_t inds[3];
-			RAND_bytes ((uint8_t *)inds, sizeof (inds));
-			std::lock_guard<std::mutex> l(m_PeersMutex);
-			auto count = m_Peers.size ();
-			if(count == 0) return nullptr;
-			inds[0] %= count;
-			auto it = m_Peers.begin ();
-			std::advance (it, inds[0]);
-			// try random peer
-			if (it != m_Peers.end () && filter (it->second))
+			bool eligibleForFirstHop = peerOrdering ? peerOrdering->IsFirstHop (ident) : true;
+			if (eligibleForFirstHop && filter (peer))
 			{
-				ident = it->first;
+				foundIdent = ident;
+				peer->lastSelectionTime = ts;
 				found = true;
 			}
-			else
+		}
+		if (!found)
+		{
+			// try some peers around
+			if (inds[0])
 			{
-				// try some peers around
-				auto it1 = m_Peers.begin ();
-				if (inds[0])
+				// before
+				inds[1] %= inds[0];
+				inds[1] = (inds[1] + inds[0])/2;
+			}
+			else
+				inds[1] = 0;
+			if (inds[0] < peers.size () - 1)
+			{
+				// after
+				inds[2] %= (peers.size () - 1 - inds[0]);
+				inds[2] /= 2;
+				inds[2] += inds[0];
+			}
+			else
+				inds[2] = inds[0];
+			// from inds[1] to inds[2]
+			for (auto i = inds[1]; i < inds[2]; i++)
+			{
+				auto& [ident, peer] = peers[i];
+				if (!peer->isDone && ts > peer->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL)
 				{
-					// before
-					inds[1] %= inds[0];
-					std::advance (it1, (inds[1] + inds[0])/2);
-				}
-				else
-					it1 = it;
-				auto it2 = it;
-				if (inds[0] < m_Peers.size () - 1)
-				{
-					// after
-					inds[2] %= (m_Peers.size () - 1 - inds[0]); inds[2] /= 2;
-					std::advance (it2, inds[2]);
-				}
-				// it1 - from, it2 - to
-				it = it1;
-				while (it != it2 && it != m_Peers.end ())
-				{
-					if (ts > it->second->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL &&
-					    filter (it->second))
+					bool eligibleForFirstHop = peerOrdering ? peerOrdering->IsFirstHop (ident) : true;
+					if (eligibleForFirstHop && filter (peer))
 					{
-						ident = it->first;
-						it->second->lastSelectionTime = ts;
+						foundIdent = ident;
+						peer->lastSelectionTime = ts;
 						found = true;
 						break;
 					}
-					it++;
 				}
-				if (!found)
+			}
+
+			if (!found)
+			{
+				// still not found, try from the beginning to inds[1]
+				for (auto i = 0; i < inds[1]; i++)
 				{
-					// still not found, try from the beginning
-					it = m_Peers.begin ();
-					while (it != it1 && it != m_Peers.end ())
+					auto& [ident, peer] = peers[i];
+					if (!peer->isDone && ts > peer->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL)
 					{
-						if (ts > it->second->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL &&
-						    filter (it->second))
+						bool eligibleForFirstHop = peerOrdering ? peerOrdering->IsFirstHop (ident) : true;
+						if (eligibleForFirstHop && filter (peer))
 						{
-							ident = it->first;
-							it->second->lastSelectionTime = ts;
+							foundIdent = ident;
+							peer->lastSelectionTime = ts;
 							found = true;
 							break;
 						}
-						it++;
 					}
-					if (!found)
+				}
+
+				if (!found)
+				{
+					// still not found, try from inds[2] to the end
+					for (auto i = inds[2]; i < peers.size (); i++)
 					{
-						// still not found, try to the beginning
-						it = it2;
-						while (it != m_Peers.end ())
+						auto& [ident, peer] = peers[i];
+						if (!peer->isDone && ts > peer->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL)
 						{
-							if (ts > it->second->lastSelectionTime + PEER_SELECTION_MIN_INTERVAL &&
-							    filter (it->second))
+							bool eligibleForFirstHop = peerOrdering ? peerOrdering->IsFirstHop (ident) : true;
+							if (eligibleForFirstHop && filter (peer))
 							{
-								ident = it->first;
-								it->second->lastSelectionTime = ts;
+								foundIdent = ident;
+								peer->lastSelectionTime = ts;
 								found = true;
 								break;
 							}
-							it++;
 						}
 					}
 				}
 			}
 		}
-		return found ? i2p::data::netdb.FindRouter (ident) : nullptr;
+		return found ? i2p::data::netdb.FindRouter (foundIdent) : nullptr;
 	}
 
-	std::shared_ptr<const i2p::data::RouterInfo> Transports::GetRandomPeer (bool isHighBandwidth) const
+	std::shared_ptr<const i2p::data::RouterInfo> Transports::GetRandomPeer (bool isHighBandwidth, i2p::data::PeerOrdering * peerOrdering) const
 	{
 		return GetRandomPeer (
 			[isHighBandwidth, this](std::shared_ptr<const Peer> peer)->bool
@@ -1265,7 +1346,8 @@ namespace transport
 					}
 				}
 				return true;
-			});
+			},
+			i2p::context.IsLimitedConnectivity () ? nullptr : peerOrdering);
 	}
 
 	void Transports::RestrictRoutesToFamilies(const std::vector<std::string_view>& families)

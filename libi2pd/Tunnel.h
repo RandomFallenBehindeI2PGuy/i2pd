@@ -89,7 +89,6 @@ namespace tunnel
 			std::shared_ptr<TunnelConfig> GetTunnelConfig () const { return m_Config; }
 			std::vector<std::shared_ptr<const i2p::data::IdentityEx> > GetPeers () const;
 			std::vector<std::shared_ptr<const i2p::data::IdentityEx> > GetInvertedPeers () const;
-			bool IsShortBuildMessage () const { return m_IsShortBuildMessage; };
 			i2p::data::RouterInfo::CompatibleTransports GetFarEndTransports () const { return m_FarEndTransports; };
 			TunnelState GetState () const { return m_State; };
 			void SetState (TunnelState state);
@@ -127,7 +126,6 @@ namespace tunnel
 
 			std::shared_ptr<TunnelConfig> m_Config;
 			std::vector<TunnelHop> m_Hops;
-			bool m_IsShortBuildMessage;
 			std::shared_ptr<TunnelPool> m_Pool; // pool, tunnel belongs to, or null
 			std::atomic<TunnelState> m_State;
 			i2p::data::RouterInfo::CompatibleTransports m_FarEndTransports;
@@ -264,6 +262,9 @@ namespace tunnel
 
 			template<class TTunnel>
 			std::shared_ptr<TTunnel> GetPendingTunnel (uint32_t replyMsgID, const std::map<uint32_t, std::shared_ptr<TTunnel> >& pendingTunnels);
+
+			template<typename TTunnel>
+			std::shared_ptr<TTunnel> GetRandomTunnel (const std::list<std::shared_ptr<TTunnel> >& tunnels);
 
 			void HandleTunnelGatewayMsg (std::shared_ptr<TunnelBase> tunnel, std::shared_ptr<I2NPMessage> msg);
 			void HandleShortTunnelBuildMsg (std::shared_ptr<I2NPMessage> msg);

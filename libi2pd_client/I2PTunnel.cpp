@@ -63,7 +63,24 @@ namespace client
 			if (msg)
 				m_Stream->Send (msg, len); // connect and send
 			else
-				m_Stream->Send (m_Buffer, 0); // connect
+			{
+				len = 0;
+				if (!m_SSL)
+				{
+					// check if something avaiable
+					boost::system::error_code ec;
+					len = m_Socket->available (ec);
+					if (!ec && len > 0)
+					{
+						if (len > i2p::stream::STREAMING_MTU_RATCHETS/2) len = i2p::stream::STREAMING_MTU_RATCHETS/2;
+						len = boost::asio::read (*m_Socket, boost::asio::buffer (m_Buffer, len), boost::asio::transfer_all (), ec);
+						if (ec) len = 0;
+					}
+					else
+						len = 0;
+				}
+				m_Stream->Send (m_Buffer, len); // connect and send if available
+			}
 			StreamReceive ();
 			Receive ();
 		}
@@ -470,7 +487,7 @@ namespace client
 						else if (boost::iequals (line.substr (0, 11), "Connection:"))
 						{
 							auto x = line.find("pgrade");
-							if (x != std::string::npos && x && std::tolower(line[x - 1]) != 'u') // upgrade or Upgrade
+							if (x != std::string::npos && x && std::tolower(line[x - 1]) == 'u') // upgrade or Upgrade
 								m_OutHeader << line << "\n";
 							else
 								m_OutHeader << "Connection: close\r\n";
